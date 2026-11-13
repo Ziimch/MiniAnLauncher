@@ -3,7 +3,10 @@ package com.example.minilauncher
 import android.app.Activity
 import android.app.ActivityOptions
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -11,8 +14,12 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.provider.AlarmClock
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -39,6 +46,10 @@ class MainActivity : Activity() {
     private var apps = listOf<App>()
     private lateinit var root: FrameLayout
     private lateinit var header: LinearLayout
+    private lateinit var greeting: TextView
+    private lateinit var batteryText: TextView
+    private lateinit var batteryFill: View
+    private lateinit var batteryFillBg: GradientDrawable
     private lateinit var scroll: ScrollView
     private lateinit var list: LinearLayout
     private lateinit var strip: LinearLayout
@@ -72,6 +83,10 @@ class MainActivity : Activity() {
         get() = readList("hidden")
         set(v) = writeList("hidden", v)
 
+    private var haptic: Boolean
+        get() = prefs.getBoolean("haptic", true)
+        set(v) { prefs.edit().putBoolean("haptic", v).apply() }
+
     // 0 = tanpa ikon, 1 = ikon warna, 2 = ikon monokrom putih
     private var iconStyle: Int
         get() = prefs.getInt("icon", 2)
@@ -95,29 +110,72 @@ class MainActivity : Activity() {
             insets
         }
 
-        // Jam besar & tipis, tanggal kecil di bawahnya
+        // Beranda: sapaan kecil, jam besar tipis, tanggal, dan garis baterai
         header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(28), dp(36), 0, 0)
+            setPadding(dp(28), dp(32), 0, 0)
             setOnLongClickListener { showSettings(); true }
         }
+        greeting = TextView(this).apply {
+            textSize = 12f
+            letterSpacing = 0.2f
+            setAllCaps(true)
+            setTextColor(Color.argb(130, 255, 255, 255))
+            setPadding(dp(4), 0, 0, dp(2))
+        }
+        header.addView(greeting)
         header.addView(TextClock(this).apply {
             format24Hour = "HH:mm"
             format12Hour = "hh:mm"
-            textSize = 68f
+            textSize = 72f
             includeFontPadding = false
             typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
             setTextColor(Color.WHITE)
         })
         header.addView(TextClock(this).apply {
-            format24Hour = "EEEE, d MMMM"
-            format12Hour = "EEEE, d MMMM"
-            textSize = 16f
-            letterSpacing = 0.04f
-            setTextColor(Color.argb(190, 255, 255, 255))
-            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
-            setPadding(dp(4), dp(2), 0, 0)
+            format24Hour = "EEEE  ·  d MMMM"
+            format12Hour = "EEEE  ·  d MMMM"
+            textSize = 13f
+            letterSpacing = 0.16f
+            setAllCaps(true)
+            setTextColor(Color.argb(200, 255, 255, 255))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(4), dp(4), 0, 0)
         })
+        batteryFillBg = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = dp(2).toFloat()
+        }
+        batteryFill = View(this).apply { background = batteryFillBg }
+        val track = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                setColor(Color.argb(60, 255, 255, 255))
+                cornerRadius = dp(2).toFloat()
+            }
+            addView(batteryFill, FrameLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        batteryText = TextView(this).apply {
+            textSize = 12f
+            letterSpacing = 0.08f
+            setTextColor(Color.argb(170, 255, 255, 255))
+        }
+        val batteryRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(16), 0, dp(6))
+            addView(track, LinearLayout.LayoutParams(dp(44), dp(3)).apply { marginEnd = dp(10) })
+            addView(batteryText)
+            setOnClickListener {
+                if (viewMode != 0) showFavorites()
+                else openSafe(Intent(Intent.ACTION_POWER_USAGE_SUMMARY), "Tidak bisa membuka pengaturan baterai")
+            }
+            setOnLongClickListener { showSettings(); true }
+        }
+        header.addView(batteryRow)
+        header.getChildAt(1).setOnClickListener { openClock() }
+        header.getChildAt(1).setOnLongClickListener { showSettings(); true }
+        header.getChildAt(2).setOnClickListener { openCalendar() }
+        header.getChildAt(2).setOnLongClickListener { showSettings(); true }
         root.addView(header, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
@@ -126,6 +184,9 @@ class MainActivity : Activity() {
         scroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
             isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isVerticalFadingEdgeEnabled = true
+            setFadingEdgeLength(dp(28))
             setOnClickListener { showFavorites() }
             setOnLongClickListener { showSettings(); true }
             addView(list, FrameLayout.LayoutParams(
@@ -134,7 +195,7 @@ class MainActivity : Activity() {
         root.addView(scroll, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ).apply {
-            topMargin = dp(180); bottomMargin = dp(32)
+            topMargin = dp(215); bottomMargin = dp(32)
             marginStart = dp(28); marginEnd = dp(64)
         })
 
@@ -145,8 +206,8 @@ class MainActivity : Activity() {
         }
         keys.forEach { k ->
             val v: View = when (k) {
-                KEY_FAV -> iconKey(R.drawable.ic_star)
-                KEY_HIDDEN -> iconKey(R.drawable.ic_lock)
+                KEY_FAV -> iconKey(R.drawable.ic_star, "Favorit")
+                KEY_HIDDEN -> iconKey(R.drawable.ic_lock, "Aplikasi tersembunyi")
                 else -> TextView(this).apply {
                     text = k
                     textSize = 10.5f
@@ -158,6 +219,11 @@ class MainActivity : Activity() {
             strip.addView(v, LinearLayout.LayoutParams(dp(44), 0, 1f))
         }
         curW = FloatArray(keys.size)
+        strip.addOnLayoutChangeListener { v, l, t, r, b, _, _, _, _ ->
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                v.systemGestureExclusionRects = listOf(Rect(0, 0, r - l, b - t))
+            }
+        }
         strip.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
@@ -167,7 +233,7 @@ class MainActivity : Activity() {
                     val idx = pos.toInt()
                     if (idx != currentKey) {
                         currentKey = idx
-                        v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        if (haptic) v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         showKey(idx)
                     }
                 }
@@ -229,14 +295,63 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun iconKey(res: Int): View = ImageView(this).apply {
+    private fun iconKey(res: Int, desc: String): View = ImageView(this).apply {
         setImageResource(res)
+        contentDescription = desc
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp(16), dp(5), dp(16), dp(5))
     }
 
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            if (i != null) updateBattery(i)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val sticky = registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (sticky != null) updateBattery(sticky)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        try { unregisterReceiver(batteryReceiver) } catch (e: Exception) { /* abaikan */ }
+    }
+
+    private fun updateBattery(i: Intent) {
+        val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        if (level < 0 || scale <= 0) return
+        val pct = level * 100 / scale
+        val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        batteryText.text = if (charging) "$pct%  ·  mengisi" else "$pct%"
+        val lp = batteryFill.layoutParams
+        lp.width = if (pct <= 0) 0 else maxOf(dp(2), dp(44) * pct / 100)
+        batteryFill.layoutParams = lp
+        batteryFillBg.setColor(
+            if (pct <= 15 && !charging) Color.parseColor("#FF6B6B") else Color.WHITE
+        )
+    }
+
+    private fun updateGreeting() {
+        val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        greeting.text = when {
+            h < 4 -> "Selamat malam"
+            h < 11 -> "Selamat pagi"
+            h < 15 -> "Selamat siang"
+            h < 18 -> "Selamat sore"
+            else -> "Selamat malam"
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        root.alpha = 0f
+        root.animate().alpha(1f).setDuration(180).start()
+        updateGreeting()
         loadApps()
         showFavorites()
         precomputeIcons()
@@ -255,17 +370,25 @@ class MainActivity : Activity() {
     private fun loadApps() {
         try {
             val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val collator = java.text.Collator.getInstance()
+            collator.strength = java.text.Collator.PRIMARY
             apps = packageManager.queryIntentActivities(i, 0)
                 .map { App(it.loadLabel(packageManager).toString(), it.activityInfo.packageName) }
                 .filter { it.pkg != packageName }
                 .distinctBy { it.pkg }
-                .sortedBy { it.label.lowercase() }
+                .sortedWith { a, b -> collator.compare(a.label, b.label) }
         } catch (e: Exception) {
             apps = emptyList()
         }
         if (prefs.getString("list", null) == null && apps.isNotEmpty()) {
             favs = apps.take(5).map { it.pkg }
         }
+    }
+
+    private fun keyOf(label: String): Char {
+        val n = java.text.Normalizer.normalize(label.trim(), java.text.Normalizer.Form.NFD)
+        val ch = n.firstOrNull()?.uppercaseChar() ?: return '#'
+        return if (ch in 'A'..'Z') ch else '#'
     }
 
     private fun visibleApps(): List<App> {
@@ -331,7 +454,12 @@ class MainActivity : Activity() {
     }
 
     private fun showHeader(show: Boolean) {
-        header.animate().alpha(if (show) 1f else 0f).setDuration(160).start()
+        header.animate()
+            .alpha(if (show) 1f else 0f)
+            .translationY(if (show) 0f else -dp(10).toFloat())
+            .setDuration(180)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
     }
 
     // ---------- Ikon monokrom ----------
@@ -464,12 +592,55 @@ class MainActivity : Activity() {
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    private fun openSafe(intent: Intent) {
+    private fun openSafe(intent: Intent, err: String = "Tidak bisa membuka pengaturan") {
         try {
             startActivity(intent)
         } catch (e: Exception) {
-            toast("Tidak bisa membuka pengaturan")
+            toast(err)
         }
+    }
+
+    private fun openClock() {
+        if (viewMode != 0) { showFavorites(); return }
+        openSafe(Intent(AlarmClock.ACTION_SHOW_ALARMS), "Aplikasi jam tidak ditemukan")
+    }
+
+    private fun openCalendar() {
+        if (viewMode != 0) { showFavorites(); return }
+        openSafe(
+            Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_CALENDAR),
+            "Aplikasi kalender tidak ditemukan"
+        )
+    }
+
+    // Dialog gelap dengan sudut membulat
+    private fun showStyled(b: AlertDialog.Builder) {
+        val d = b.create()
+        val bg = GradientDrawable().apply {
+            setColor(Color.parseColor("#1C1C1E"))
+            cornerRadius = dp(22).toFloat()
+        }
+        d.window?.setBackgroundDrawable(InsetDrawable(bg, dp(16)))
+        d.show()
+    }
+
+    // Pengganti ikon monokrom yang gagal dibuat: lingkaran dengan huruf awal
+    private fun placeholderIcon(label: String): Bitmap {
+        val s = 64
+        val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.color = Color.WHITE
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        c.drawCircle(s / 2f, s / 2f, s / 2f - 4f, p)
+        p.style = Paint.Style.FILL
+        p.textSize = 32f
+        p.textAlign = Paint.Align.CENTER
+        p.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        val ch = label.firstOrNull()?.uppercaseChar()?.toString() ?: "?"
+        c.drawText(ch, s / 2f, s / 2f + 11f, p)
+        return b
     }
 
     private fun row(app: App, iconMode: Int, textSp: Float): View {
@@ -478,6 +649,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, padV, 0, padV)
+            minimumHeight = dp(48)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
@@ -486,7 +658,7 @@ class MainActivity : Activity() {
             iv.scaleType = ImageView.ScaleType.FIT_CENTER
             try {
                 if (iconMode == 2) {
-                    monoIcon(app.pkg)?.let { iv.setImageBitmap(it) }
+                    iv.setImageBitmap(monoIcon(app.pkg) ?: placeholderIcon(app.label))
                 } else {
                     iv.setImageDrawable(colorIcon(app.pkg))
                 }
@@ -507,9 +679,9 @@ class MainActivity : Activity() {
         r.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN ->
-                    v.animate().alpha(0.55f).scaleX(0.97f).scaleY(0.97f).setDuration(80).start()
+                    v.animate().setStartDelay(0).alpha(0.55f).scaleX(0.97f).scaleY(0.97f).setDuration(80).start()
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-                    v.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).start()
+                    v.animate().setStartDelay(0).alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).start()
             }
             false
         }
@@ -550,29 +722,42 @@ class MainActivity : Activity() {
             openSafe(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                 Uri.parse("package:" + app.pkg)))
         })
-        AlertDialog.Builder(this)
+        opts.add("Copot pemasangan" to {
+            openSafe(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.pkg)),
+                "Tidak bisa mencopot ${app.label}")
+        })
+        showStyled(AlertDialog.Builder(this)
             .setTitle(app.label)
             .setItems(opts.map { it.first }.toTypedArray()) { _, i -> opts[i].second() }
-            .show()
+        )
     }
 
     // Pengaturan (tekan lama jam / area kosong)
     private fun showSettings() {
-        val items = arrayOf("Gaya ikon", "Atur launcher default", "Pengaturan sistem")
-        AlertDialog.Builder(this)
+        val items = arrayOf(
+            "Gaya ikon",
+            "Getaran saat geser huruf: " + (if (haptic) "aktif" else "mati"),
+            "Atur launcher default",
+            "Pengaturan sistem"
+        )
+        showStyled(AlertDialog.Builder(this)
             .setTitle("Pengaturan")
             .setItems(items) { _, i ->
                 when (i) {
                     0 -> pickIconStyle()
-                    1 -> openSafe(Intent(Settings.ACTION_HOME_SETTINGS))
-                    2 -> openSafe(Intent(Settings.ACTION_SETTINGS))
+                    1 -> {
+                        haptic = !haptic
+                        toast(if (haptic) "Getaran aktif" else "Getaran mati")
+                    }
+                    2 -> openSafe(Intent(Settings.ACTION_HOME_SETTINGS))
+                    3 -> openSafe(Intent(Settings.ACTION_SETTINGS))
                 }
             }
-            .show()
+        )
     }
 
     private fun pickIconStyle() {
-        AlertDialog.Builder(this)
+        showStyled(AlertDialog.Builder(this)
             .setTitle("Gaya ikon")
             .setSingleChoiceItems(
                 arrayOf("Tanpa ikon", "Ikon warna", "Ikon monokrom (putih)"), iconStyle
@@ -581,7 +766,7 @@ class MainActivity : Activity() {
                 d.dismiss()
                 renderCurrent()
             }
-            .show()
+        )
     }
 
     // ---------- Tampilan daftar ----------
@@ -639,10 +824,7 @@ class MainActivity : Activity() {
             setTextColor(Color.argb(150, 255, 255, 255))
             setPadding(0, 0, 0, dp(6))
         })
-        val matches = visibleApps().filter {
-            val f = it.label.firstOrNull()?.uppercaseChar() ?: '#'
-            if (c == '#') f !in 'A'..'Z' else f == c
-        }
+        val matches = visibleApps().filter { keyOf(it.label) == c }
         if (matches.isEmpty()) {
             list.addView(TextView(this).apply {
                 text = "Tidak ada aplikasi"

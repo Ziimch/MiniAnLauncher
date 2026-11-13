@@ -15,6 +15,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
@@ -25,6 +26,7 @@ import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.Settings
 import android.text.TextUtils
+import android.util.LruCache
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -53,6 +55,8 @@ class MainActivity : Activity() {
     private lateinit var header: LinearLayout
     private lateinit var greeting: TextView
     private lateinit var pill: TextView
+    private lateinit var bigLetter: TextView
+    private var bigShown: Char? = null
     private lateinit var batteryText: TextView
     private lateinit var batteryFill: View
     private lateinit var batteryFillBg: GradientDrawable
@@ -81,13 +85,16 @@ class MainActivity : Activity() {
         prefs.edit().putString(key, v.joinToString(",")).apply()
     }
 
+    private var favCache: List<String>? = null
+    private var hiddenCache: List<String>? = null
+
     private var favs: List<String>
-        get() = readList("list")
-        set(v) = writeList("list", v)
+        get() = favCache ?: readList("list").also { favCache = it }
+        set(v) { favCache = v; writeList("list", v) }
 
     private var hidden: List<String>
-        get() = readList("hidden")
-        set(v) = writeList("hidden", v)
+        get() = hiddenCache ?: readList("hidden").also { hiddenCache = it }
+        set(v) { hiddenCache = v; writeList("hidden", v) }
 
     private var hideStatus: Boolean
         get() = prefs.getBoolean("hide_status", true)
@@ -107,7 +114,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         root = FrameLayout(this)
         root.clipChildren = false
-        root.setBackgroundColor(Color.BLACK)
         root.setOnClickListener { showFavorites() }
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -256,6 +262,17 @@ class MainActivity : Activity() {
             topMargin = dp(120); bottomMargin = dp(32)
         })
 
+        bigLetter = TextView(this).apply {
+            textSize = 110f
+            includeFontPadding = false
+            typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+            setTextColor(Color.argb(70, 255, 255, 255))
+            setPadding(dp(24), dp(44), 0, 0)
+            alpha = 0f
+        }
+        root.addView(bigLetter, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
         pill = TextView(this).apply {
             textSize = 14f
             maxWidth = dp(300)
@@ -273,6 +290,13 @@ class MainActivity : Activity() {
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             bottomMargin = dp(28)
+        })
+
+        registerReceiver(pkgReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addDataScheme("package")
         })
 
         setContentView(root)
@@ -349,6 +373,25 @@ class MainActivity : Activity() {
         if (hasFocus) applySystemUi()
     }
 
+    @Volatile private var appsDirty = true
+
+    private val pkgReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            appsDirty = true
+            val pkg = i?.data?.schemeSpecificPart
+            if (pkg != null) {
+                iconCache.remove("m:$pkg")
+                iconCache.remove("c:$pkg")
+                noMono.remove(pkg)
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(pkgReceiver) } catch (e: Exception) { /* abaikan */ }
+    }
+
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             if (i != null) updateBattery(i)
@@ -415,6 +458,7 @@ class MainActivity : Activity() {
     }
 
     private fun loadApps() {
+        if (!appsDirty && apps.isNotEmpty()) return
         try {
             val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val collator = java.text.Collator.getInstance()
@@ -424,6 +468,7 @@ class MainActivity : Activity() {
                 .filter { it.pkg != packageName }
                 .distinctBy { it.pkg }
                 .sortedWith { a, b -> collator.compare(a.label, b.label) }
+            appsDirty = false
         } catch (e: Exception) {
             apps = emptyList()
         }
@@ -500,6 +545,25 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showBigLetter(c: Char?) {
+        if (c == null) {
+            bigShown = null
+            bigLetter.animate().alpha(0f).setDuration(150).start()
+            return
+        }
+        if (bigShown != c) {
+            bigLetter.text = c.toString()
+            bigLetter.scaleX = 0.9f
+            bigLetter.scaleY = 0.9f
+        }
+        bigShown = c
+        bigLetter.animate()
+            .alpha(1f).scaleX(1f).scaleY(1f)
+            .setDuration(140)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+    }
+
     private fun showHeader(show: Boolean) {
         header.animate()
             .alpha(if (show) 1f else 0f)
@@ -511,37 +575,53 @@ class MainActivity : Activity() {
 
     // ---------- Ikon monokrom ----------
 
-    private val monoCache = java.util.concurrent.ConcurrentHashMap<String, Any>()
-    private val colorCache = java.util.concurrent.ConcurrentHashMap<String, Drawable.ConstantState>()
-    private val NONE = Any()
+    // Ikon disimpan sebagai bitmap kecil dalam cache berbatas 6 MB.
+    // (Sebelumnya drawable ikon utuh ikut tersimpan -> memori besar.)
+    private val iconCache = object : LruCache<String, Bitmap>(6 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+    private val noMono: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
     private fun monoIcon(pkg: String): Bitmap? {
-        val c = monoCache[pkg]
-        if (c != null) return c as? Bitmap
+        iconCache.get("m:$pkg")?.let { return it }
+        if (pkg in noMono) return null
         val bmp = try { buildMono(pkg) } catch (e: Exception) { null }
-        monoCache[pkg] = bmp ?: NONE
+        if (bmp != null) iconCache.put("m:$pkg", bmp) else noMono.add(pkg)
         return bmp
     }
 
-    private fun colorIcon(pkg: String): Drawable? {
-        val cs = colorCache[pkg]
-        if (cs != null) return cs.newDrawable()
+    private fun colorIcon(pkg: String): Bitmap? {
+        iconCache.get("c:$pkg")?.let { return it }
         val d = packageManager.getApplicationIcon(pkg)
-        d.constantState?.let { colorCache[pkg] = it }
-        return d
+        val px = dp(32)
+        val b = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+        d.setBounds(0, 0, px, px)
+        d.draw(Canvas(b))
+        iconCache.put("c:$pkg", b)
+        return b
     }
 
-    // Siapkan ikon di latar belakang supaya menggeser huruf tidak tersendat
+    @Volatile private var precomputing = false
+
+    // Siapkan ikon di latar belakang pelan-pelan (favorit dulu) agar tidak menumpuk memori
     private fun precomputeIcons() {
-        val pkgs = apps.map { it.pkg }
         val style = iconStyle
-        if (style == 0) return
+        if (style == 0 || precomputing) return
+        val fav = favs
+        val pkgs = apps.map { it.pkg }.sortedBy { if (it in fav) 0 else 1 }
+        precomputing = true
         Thread {
             Thread.currentThread().priority = Thread.MIN_PRIORITY
-            for (p in pkgs) {
-                try {
-                    if (style == 2) monoIcon(p) else colorIcon(p)
-                } catch (e: Exception) { /* abaikan */ }
+            try {
+                for (p in pkgs) {
+                    try {
+                        if (style == 2) monoIcon(p) else colorIcon(p)
+                    } catch (e: Exception) { /* abaikan */ }
+                    Thread.sleep(6)
+                }
+            } finally {
+                precomputing = false
             }
         }.start()
     }
@@ -622,7 +702,11 @@ class MainActivity : Activity() {
             Rect(left, top, left + bw, top + bh),
             Paint(Paint.FILTER_BITMAP_FLAG)
         )
-        return result
+        src.recycle()
+        glyph.recycle()
+        val fin = Bitmap.createScaledBitmap(result, 64, 64, true)
+        if (fin !== result) result.recycle()
+        return fin
     }
 
     // ---------- Aksi ----------
@@ -722,7 +806,7 @@ class MainActivity : Activity() {
                 if (iconMode == 2) {
                     iv.setImageBitmap(monoIcon(app.pkg) ?: placeholderIcon(app.label))
                 } else {
-                    iv.setImageDrawable(colorIcon(app.pkg))
+                    iv.setImageBitmap(colorIcon(app.pkg))
                 }
             } catch (e: Exception) { /* abaikan */ }
             r.addView(iv, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(20) })
@@ -914,7 +998,9 @@ class MainActivity : Activity() {
             openSafe(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.pkg)),
                 "Tidak bisa mencopot ${app.label}")
         })
-        val icon = try { colorIcon(app.pkg) } catch (e: Exception) { null }
+        val icon = try {
+            colorIcon(app.pkg)?.let { BitmapDrawable(resources, it) }
+        } catch (e: Exception) { null }
         showSheet(app.label, icon, es)
     }
 
@@ -973,6 +1059,7 @@ class MainActivity : Activity() {
     private fun showFavorites() {
         viewMode = 0
         showHeader(true)
+        showBigLetter(null)
         list.gravity = Gravity.BOTTOM
         list.removeAllViews()
         scroll.scrollTo(0, 0)
@@ -996,17 +1083,11 @@ class MainActivity : Activity() {
         viewMode = 1
         viewLetter = c
         showHeader(false)
+        showBigLetter(c)
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)
         val mode = iconStyle
-        list.addView(TextView(this).apply {
-            text = c.toString()
-            textSize = 13f
-            letterSpacing = 0.15f
-            setTextColor(Color.argb(150, 255, 255, 255))
-            setPadding(0, 0, 0, dp(6))
-        })
         val matches = visibleApps().filter { keyOf(it.label) == c }
         if (matches.isEmpty()) {
             list.addView(TextView(this).apply {
@@ -1022,6 +1103,7 @@ class MainActivity : Activity() {
     private fun showHidden() {
         viewMode = 2
         showHeader(false)
+        showBigLetter(null)
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)

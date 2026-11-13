@@ -7,6 +7,7 @@ import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -54,6 +55,7 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var header: LinearLayout
     private lateinit var greeting: TextView
+    private lateinit var scrim: View
     private lateinit var clockTime: TextClock
     private lateinit var clockDate: TextClock
     private lateinit var pill: TextView
@@ -66,6 +68,11 @@ class MainActivity : Activity() {
     private lateinit var list: LinearLayout
     private lateinit var strip: LinearLayout
     private var currentKey = -1
+    private var lastSig: String? = null
+    @Volatile private var loading = false
+    private val iconExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var accentNow = Color.WHITE
+    private var lowBattery = false
 
     // 0 = favorit, 1 = daftar huruf, 2 = aplikasi tersembunyi
     private var viewMode = 0
@@ -102,6 +109,16 @@ class MainActivity : Activity() {
     private val bgNames = listOf("Hitam polos", "Wallpaper redup", "Wallpaper jernih")
     private val iconNames = listOf("Tanpa ikon", "Ikon warna", "Monokrom")
 
+    private val accentNames = listOf("Putih", "Biru", "Mint", "Oranye", "Pink", "Ungu")
+    private val accentColors = intArrayOf(
+        0xFFFFFFFF.toInt(), 0xFF8AB4FF.toInt(), 0xFF7EE0B5.toInt(),
+        0xFFFFB070.toInt(), 0xFFFF8FB8.toInt(), 0xFFB79CFF.toInt()
+    )
+
+    private var accentIdx: Int
+        get() = prefs.getInt("accent", 0).coerceIn(0, accentColors.size - 1)
+        set(v) { prefs.edit().putInt("accent", v).apply() }
+
     private var clockStyle: Int
         get() = prefs.getInt("clock", 0).coerceIn(0, 2)
         set(v) { prefs.edit().putInt("clock", v).apply() }
@@ -136,14 +153,24 @@ class MainActivity : Activity() {
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
             val cut = insets.displayCutout?.safeInsetTop ?: 0
-            v.setPadding(0, maxOf(insets.systemWindowInsetTop, cut), 0, insets.systemWindowInsetBottom)
+            v.setPadding(0, maxOf(insets.stableInsetTop, cut), 0, insets.stableInsetBottom)
             insets
         }
+
+        scrim = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0x00000000, Color.argb(170, 0, 0, 0))
+            )
+            visibility = View.GONE
+        }
+        root.addView(scrim, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(460), Gravity.BOTTOM))
 
         // Beranda: sapaan kecil, jam besar tipis, tanggal, dan garis baterai
         header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(28), dp(32), 0, 0)
+            setPadding(dp(28), dp(40), 0, 0)
             setOnLongClickListener { showSettings(); true }
         }
         greeting = TextView(this).apply {
@@ -313,6 +340,7 @@ class MainActivity : Activity() {
         setContentView(root)
         applySystemUi()
         applyBackground()
+        applyAccent()
     }
 
     // ---------- Gesek ke bawah: panel notifikasi ----------
@@ -420,6 +448,41 @@ class MainActivity : Activity() {
         header.getChildAt(3).visibility = v
     }
 
+    private fun applyAccent() {
+        accentNow = accentColors[accentIdx]
+        val a = accentNow
+        val r = Color.red(a)
+        val g = Color.green(a)
+        val b = Color.blue(a)
+        clockTime.setTextColor(a)
+        clockDate.setTextColor(Color.argb(215, r, g, b))
+        bigLetter.setTextColor(Color.argb(80, r, g, b))
+        batteryFillBg.setColor(if (lowBattery) Color.parseColor("#FF6B6B") else a)
+        for (i in 0 until strip.childCount) {
+            (strip.getChildAt(i) as? TextView)?.setTextColor(Color.WHITE)
+        }
+    }
+
+    private fun blend(a: Int, b: Int, t: Float): Int {
+        val r = (Color.red(a) + (Color.red(b) - Color.red(a)) * t).toInt()
+        val g = (Color.green(a) + (Color.green(b) - Color.green(a)) * t).toInt()
+        val bl = (Color.blue(a) + (Color.blue(b) - Color.blue(a)) * t).toInt()
+        return Color.rgb(r, g, bl)
+    }
+
+    // Jangan sampai kesalahan kecil membuat launcher crash (lalu HP kembali ke launcher bawaan)
+    private fun safely(block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) { /* abaikan */ }
+    }
+
+    private fun isDefaultHome(): Boolean = try {
+        val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        packageManager.resolveActivity(i, PackageManager.MATCH_DEFAULT_ONLY)
+            ?.activityInfo?.packageName == packageName
+    } catch (e: Exception) { false }
+
     // Latar: hitam polos, atau wallpaper sistem dengan lapisan gelap
     @Suppress("DEPRECATION")
     private fun applyBackground() {
@@ -427,7 +490,9 @@ class MainActivity : Activity() {
             window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
             window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
             root.setBackgroundColor(Color.TRANSPARENT)
+            scrim.visibility = View.GONE
         } else {
+            scrim.visibility = View.VISIBLE
             window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
             window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             root.setBackgroundColor(Color.argb(if (bgMode == 1) 150 else 55, 0, 0, 0))
@@ -444,7 +509,6 @@ class MainActivity : Activity() {
             f = f or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         }
         window.decorView.systemUiVisibility = f
-        header.setPadding(dp(28), dp(if (hideStatus) 44 else 32), 0, 0)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -469,6 +533,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         try { unregisterReceiver(pkgReceiver) } catch (e: Exception) { /* abaikan */ }
+        iconExec.shutdownNow()
     }
 
     private val batteryReceiver = object : BroadcastReceiver() {
@@ -500,9 +565,8 @@ class MainActivity : Activity() {
         val lp = batteryFill.layoutParams
         lp.width = if (pct <= 0) 0 else maxOf(dp(2), dp(44) * pct / 100)
         batteryFill.layoutParams = lp
-        batteryFillBg.setColor(
-            if (pct <= 15 && !charging) Color.parseColor("#FF6B6B") else Color.WHITE
-        )
+        lowBattery = pct <= 15 && !charging
+        batteryFillBg.setColor(if (lowBattery) Color.parseColor("#FF6B6B") else accentNow)
     }
 
     private fun updateGreeting() {
@@ -518,17 +582,22 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        root.alpha = 0f
-        root.animate().alpha(1f).setDuration(180).start()
-        updateGreeting()
-        loadApps()
-        showFavorites()
-        precomputeIcons()
+        safely { updateGreeting() }
+        safely { showFavorites() }
+        loadAppsAsync()
+        safely { precomputeIcons() }
     }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        showFavorites() // tombol Home ditekan saat launcher sudah terbuka
+        safely { showFavorites() } // tombol Home ditekan saat launcher sudah terbuka
+    }
+
+    // Saat sistem butuh memori, lepaskan cache ikon agar proses tidak mudah dimatikan
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= 40) iconCache.evictAll()          // proses di latar belakang
+        else if (level >= 20) iconCache.trimToSize(2 * 1024 * 1024) // UI tersembunyi
     }
 
     @Deprecated("Deprecated in Java")
@@ -536,24 +605,39 @@ class MainActivity : Activity() {
         showFavorites()
     }
 
-    private fun loadApps() {
-        if (!appsDirty && apps.isNotEmpty()) return
-        try {
-            val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            val collator = java.text.Collator.getInstance()
-            collator.strength = java.text.Collator.PRIMARY
-            apps = packageManager.queryIntentActivities(i, 0)
-                .map { App(it.loadLabel(packageManager).toString(), it.activityInfo.packageName) }
-                .filter { it.pkg != packageName }
-                .distinctBy { it.pkg }
-                .sortedWith { a, b -> collator.compare(a.label, b.label) }
-            appsDirty = false
-        } catch (e: Exception) {
-            apps = emptyList()
-        }
-        if (prefs.getString("list", null) == null && apps.isNotEmpty()) {
-            favs = apps.take(5).map { it.pkg }
-        }
+    private fun queryApps(): List<App> {
+        val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val collator = java.text.Collator.getInstance()
+        collator.strength = java.text.Collator.PRIMARY
+        return packageManager.queryIntentActivities(i, 0)
+            .map { App(it.loadLabel(packageManager).toString(), it.activityInfo.packageName) }
+            .filter { it.pkg != packageName }
+            .distinctBy { it.pkg }
+            .sortedWith { a, b -> collator.compare(a.label, b.label) }
+    }
+
+    // Dimuat di thread terpisah supaya tidak membekukan layar (risiko ANR di HP yang lambat)
+    private fun loadAppsAsync() {
+        if ((!appsDirty && apps.isNotEmpty()) || loading) return
+        loading = true
+        Thread {
+            val result = try { queryApps() } catch (e: Exception) { null }
+            runOnUiThread {
+                loading = false
+                if (result != null) {
+                    apps = result
+                    appsDirty = false
+                }
+                safely {
+                    if (prefs.getString("list", null) == null && apps.isNotEmpty()) {
+                        favs = apps.take(5).map { it.pkg }
+                    }
+                    lastSig = null
+                    renderCurrent()
+                    precomputeIcons()
+                }
+            }
+        }.start()
     }
 
     private fun keyOf(label: String): Char {
@@ -597,6 +681,7 @@ class MainActivity : Activity() {
                 c.scaleX = sc
                 c.scaleY = sc
                 c.alpha = base + (1f - base) * w
+                if (c is TextView) c.setTextColor(blend(Color.WHITE, accentNow, w))
             }
             if (moving || touching) strip.postOnAnimation(this) else frameRunning = false
         }
@@ -868,6 +953,37 @@ class MainActivity : Activity() {
         return b
     }
 
+    // Ikon dari cache langsung dipasang; jika belum ada, dibuat di latar belakang lalu muncul halus
+    private fun bindIcon(iv: ImageView, app: App, mode: Int) {
+        val key = (if (mode == 2) "m:" else "c:") + app.pkg
+        val cached = iconCache.get(key)
+        if (cached != null) {
+            iv.setImageBitmap(cached)
+            return
+        }
+        if (mode == 2 && app.pkg in noMono) {
+            iv.setImageBitmap(placeholderIcon(app.label))
+            return
+        }
+        iv.tag = app.pkg
+        iv.alpha = 0f
+        try {
+            iconExec.execute {
+                val b = try {
+                    if (mode == 2) monoIcon(app.pkg) else colorIcon(app.pkg)
+                } catch (e: Throwable) { null }
+                iv.post {
+                    if (iv.tag == app.pkg) {
+                        iv.setImageBitmap(b ?: if (mode == 2) placeholderIcon(app.label) else null)
+                        iv.animate().alpha(1f).setDuration(120).start()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            iv.alpha = 1f
+        }
+    }
+
     private fun row(app: App, iconMode: Int, textSp: Float): View {
         val padV = dp(if (iconMode != 0) 9 else 10)
         val r = LinearLayout(this).apply {
@@ -881,13 +997,7 @@ class MainActivity : Activity() {
         if (iconMode != 0) {
             val iv = ImageView(this)
             iv.scaleType = ImageView.ScaleType.FIT_CENTER
-            try {
-                if (iconMode == 2) {
-                    iv.setImageBitmap(monoIcon(app.pkg) ?: placeholderIcon(app.label))
-                } else {
-                    iv.setImageBitmap(colorIcon(app.pkg))
-                }
-            } catch (e: Exception) { /* abaikan */ }
+            bindIcon(iv, app, iconMode)
             r.addView(iv, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(20) })
         }
         r.addView(TextView(this).apply {
@@ -1006,9 +1116,15 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
 
-        val wrap = FrameLayout(this).apply {
-            setPadding(dp(12), 0, dp(12), dp(12))
+        val sv = ScrollView(this).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isVerticalScrollBarEnabled = false
             addView(card, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            addView(sv, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         dlg.setContentView(wrap)
@@ -1099,6 +1215,12 @@ class MainActivity : Activity() {
                     applyBackground()
                 }
             },
+            Entry(0, "Warna aksen", accentNames[accentIdx]) {
+                pickOption("Warna aksen", accentNames, accentIdx) {
+                    accentIdx = it
+                    applyAccent()
+                }
+            },
             Entry(0, "Gaya ikon", iconNames[iconStyle.coerceIn(0, 2)]) {
                 pickOption("Gaya ikon", iconNames, iconStyle) {
                     iconStyle = it
@@ -1120,14 +1242,45 @@ class MainActivity : Activity() {
                 applySystemUi()
                 showSettings()
             },
+            Entry(0, "Bersihkan cache", cacheSizeText()) { clearCache() },
             Entry(0, "Ganti wallpaper") {
                 openSafe(
                     Intent.createChooser(Intent(Intent.ACTION_SET_WALLPAPER), "Pilih wallpaper"),
                     "Tidak bisa membuka pilihan wallpaper"
                 )
             },
-            Entry(0, "Atur launcher default") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) }
+            Entry(0, "Launcher default", if (isDefaultHome()) "Aktif" else "Belum diatur") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) }
         ))
+    }
+
+    // ---------- Cache ----------
+
+    private fun dirSize(dir: java.io.File?): Long =
+        dir?.walkTopDown()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
+
+    private fun formatSize(bytes: Long): String =
+        if (bytes < 1024L * 1024L) "${bytes / 1024} KB"
+        else "%.1f MB".format(bytes / 1048576.0)
+
+    private fun cacheBytes(): Long =
+        iconCache.size().toLong() + dirSize(cacheDir) + dirSize(externalCacheDir)
+
+    private fun cacheSizeText(): String = formatSize(cacheBytes())
+
+    // Membersihkan cache launcher ini saja (ikon di memori + file cache).
+    // Android tidak mengizinkan aplikasi biasa menghapus cache aplikasi lain.
+    private fun clearCache() {
+        val before = cacheBytes()
+        iconCache.evictAll()
+        noMono.clear()
+        try {
+            cacheDir.listFiles()?.forEach { it.deleteRecursively() }
+            externalCacheDir?.listFiles()?.forEach { it.deleteRecursively() }
+        } catch (e: Exception) { /* abaikan */ }
+        lastSig = null
+        renderCurrent()
+        precomputeIcons()
+        toast("Cache dibersihkan · ${formatSize(before)}")
     }
 
     // Daftar pilihan dengan centang; setelah memilih kembali ke Pengaturan
@@ -1143,10 +1296,12 @@ class MainActivity : Activity() {
     // ---------- Tampilan daftar ----------
 
     private fun showKey(idx: Int) {
-        when (val k = keys[idx]) {
-            KEY_FAV -> showFavorites()
-            KEY_HIDDEN -> showHidden()
-            else -> showLetter(k[0])
+        safely {
+            when (val k = keys[idx]) {
+                KEY_FAV -> showFavorites()
+                KEY_HIDDEN -> showHidden()
+                else -> showLetter(k[0])
+            }
         }
     }
 
@@ -1162,12 +1317,15 @@ class MainActivity : Activity() {
         viewMode = 0
         showHeader(true)
         showBigLetter(null)
+        val sig = "f|" + favs.joinToString(",") + "|" + hidden.size + "|" + iconStyle + "|" + apps.size
+        if (sig == lastSig && list.childCount > 0) return
+        lastSig = sig
         list.gravity = Gravity.BOTTOM
         list.removeAllViews()
         scroll.scrollTo(0, 0)
         val vis = visibleApps()
         val items = favs.mapNotNull { p -> vis.find { it.pkg == p } }
-        if (items.isEmpty()) {
+        if (items.isEmpty() && apps.isNotEmpty()) {
             list.addView(TextView(this).apply {
                 text = "Geser huruf di kanan, lalu tekan lama aplikasi untuk menambah favorit"
                 textSize = 14f
@@ -1182,10 +1340,14 @@ class MainActivity : Activity() {
     }
 
     private fun showLetter(c: Char) {
+        val wasLetter = viewMode == 1
         viewMode = 1
         viewLetter = c
         showHeader(false)
         showBigLetter(c)
+        val sig = "l|$c|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size
+        if (sig == lastSig && list.childCount > 0) return
+        lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)
@@ -1199,13 +1361,16 @@ class MainActivity : Activity() {
             })
         }
         matches.forEach { app -> list.addView(row(app, mode, 18f)) }
-        animateRows()
+        if (!wasLetter) animateRows()
     }
 
     private fun showHidden() {
         viewMode = 2
         showHeader(false)
         showBigLetter(null)
+        val sig = "h|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size
+        if (sig == lastSig && list.childCount > 0) return
+        lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)

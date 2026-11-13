@@ -1,12 +1,15 @@
 package com.example.minilauncher
 
 import android.app.Activity
+import android.app.ActivityOptions
 import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Typeface
-import android.graphics.drawable.AdaptiveIconDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -15,6 +18,8 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -43,8 +48,8 @@ class MainActivity : Activity() {
 
     private val prefs by lazy { getSharedPreferences("fav", MODE_PRIVATE) }
 
-    private val KEY_FAV = "★"
-    private val KEY_HIDDEN = "🔒"
+    private val KEY_FAV = "fav"
+    private val KEY_HIDDEN = "hidden"
     private val keys: List<String> =
         listOf(KEY_FAV) + ('A'..'Z').map { it.toString() } + "#" + KEY_HIDDEN
 
@@ -70,19 +75,6 @@ class MainActivity : Activity() {
         get() = prefs.getInt("icon", 2)
         set(v) { prefs.edit().putInt("icon", v).apply() }
 
-    private var dim: Int
-        get() = prefs.getInt("dim", 150)
-        set(v) { prefs.edit().putInt("dim", v).apply() }
-
-    private val whiteFilter = ColorMatrixColorFilter(
-        floatArrayOf(
-            0f, 0f, 0f, 0f, 255f,
-            0f, 0f, 0f, 0f, 255f,
-            0f, 0f, 0f, 0f, 255f,
-            0f, 0f, 0f, 1f, 0f
-        )
-    )
-
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -93,7 +85,7 @@ class MainActivity : Activity() {
 
         root = FrameLayout(this)
         root.clipChildren = false
-        root.setBackgroundColor(Color.argb(dim, 0, 0, 0))
+        root.setBackgroundColor(Color.BLACK)
         root.setOnClickListener { showFavorites() }
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -149,12 +141,17 @@ class MainActivity : Activity() {
             clipChildren = false
         }
         keys.forEach { k ->
-            strip.addView(TextView(this).apply {
-                text = k
-                textSize = 11f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-            }, LinearLayout.LayoutParams(dp(44), 0, 1f))
+            val v: View = when (k) {
+                KEY_FAV -> iconKey(R.drawable.ic_star)
+                KEY_HIDDEN -> iconKey(R.drawable.ic_lock)
+                else -> TextView(this).apply {
+                    text = k
+                    textSize = 11f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.WHITE)
+                }
+            }
+            strip.addView(v, LinearLayout.LayoutParams(dp(44), 0, 1f))
         }
         strip.setOnTouchListener { v, e ->
             when (e.actionMasked) {
@@ -180,6 +177,12 @@ class MainActivity : Activity() {
         })
 
         setContentView(root)
+    }
+
+    private fun iconKey(res: Int): View = ImageView(this).apply {
+        setImageResource(res)
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
+        setPadding(dp(16), dp(5), dp(16), dp(5))
     }
 
     override fun onResume() {
@@ -219,17 +222,22 @@ class MainActivity : Activity() {
         return apps.filter { it.pkg !in h }
     }
 
-    // Efek lengkung seperti Niagara: huruf dekat jari bergeser ke kiri & membesar
+    // ---------- Animasi ----------
+
+    // Efek lengkung ala Niagara: huruf dekat jari bergeser ke kiri & membesar, halus
     private fun fisheye(pos: Float) {
         for (i in 0 until strip.childCount) {
             val c = strip.getChildAt(i)
             val d = abs(i + 0.5f - pos)
-            val w = exp(-d * d / 4f)
-            c.animate().cancel()
-            c.translationX = -dp(40) * w
-            c.scaleX = 1f + 0.9f * w
-            c.scaleY = 1f + 0.9f * w
-            c.alpha = 0.45f + 0.55f * w
+            val w = exp(-d * d / 6f)
+            c.animate()
+                .translationX(-dp(44) * w)
+                .scaleX(1f + 0.9f * w)
+                .scaleY(1f + 0.9f * w)
+                .alpha(0.4f + 0.6f * w)
+                .setDuration(70)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
         }
     }
 
@@ -237,13 +245,128 @@ class MainActivity : Activity() {
         for (i in 0 until strip.childCount) {
             strip.getChildAt(i).animate()
                 .translationX(0f).scaleX(1f).scaleY(1f).alpha(1f)
-                .setDuration(150).start()
+                .setDuration(280)
+                .setInterpolator(OvershootInterpolator(1.4f))
+                .start()
         }
     }
 
-    private fun launch(app: App) {
+    // Baris muncul bergantian: fade + geser dari kanan
+    private fun animateRows() {
+        for (i in 0 until list.childCount) {
+            val v = list.getChildAt(i)
+            v.alpha = 0f
+            v.translationX = dp(20).toFloat()
+            v.animate()
+                .alpha(1f).translationX(0f)
+                .setStartDelay(minOf(i, 6) * 18L)
+                .setDuration(170)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
+        }
+    }
+
+    private fun showHeader(show: Boolean) {
+        header.animate().alpha(if (show) 1f else 0f).setDuration(160).start()
+    }
+
+    // ---------- Ikon monokrom ----------
+
+    private val monoCache = HashMap<String, Bitmap?>()
+
+    private fun monoIcon(pkg: String): Bitmap? {
+        if (monoCache.containsKey(pkg)) return monoCache[pkg]
+        val bmp = try { buildMono(pkg) } catch (e: Exception) { null }
+        monoCache[pkg] = bmp
+        return bmp
+    }
+
+    // Ubah ikon jadi siluet putih: latar ikon dibuang, hanya simbolnya yang tersisa
+    private fun buildMono(pkg: String): Bitmap? {
+        val s = 96
+        val raw = packageManager.getApplicationIcon(pkg)
+        val d = raw.constantState?.newDrawable()?.mutate() ?: raw
+        val src = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        d.setBounds(0, 0, s, s)
+        d.draw(Canvas(src))
+        val px = IntArray(s * s)
+        src.getPixels(px, 0, s, 0, 0, s, s)
+
+        // Warna latar = nilai tengah dari beberapa titik di tepi ikon
+        val pts = arrayOf(
+            intArrayOf(50, 10), intArrayOf(50, 90), intArrayOf(10, 50), intArrayOf(90, 50),
+            intArrayOf(22, 22), intArrayOf(78, 22), intArrayOf(22, 78), intArrayOf(78, 78)
+        )
+        val rs = ArrayList<Int>()
+        val gs = ArrayList<Int>()
+        val bs = ArrayList<Int>()
+        for (p in pts) {
+            val c = px[(p[1] * s / 100) * s + (p[0] * s / 100)]
+            if (Color.alpha(c) > 220) {
+                rs.add(Color.red(c)); gs.add(Color.green(c)); bs.add(Color.blue(c))
+            }
+        }
+        val hasBg = rs.size >= 5
+        val bgR = if (hasBg) rs.sorted()[rs.size / 2] else 0
+        val bgG = if (hasBg) gs.sorted()[gs.size / 2] else 0
+        val bgB = if (hasBg) bs.sorted()[bs.size / 2] else 0
+
+        val out = IntArray(s * s)
+        var minX = s; var minY = s; var maxX = -1; var maxY = -1
+        var on = 0
+        for (y in 0 until s) {
+            for (x in 0 until s) {
+                val c = px[y * s + x]
+                val a0 = Color.alpha(c)
+                val a = when {
+                    a0 == 0 -> 0
+                    hasBg -> {
+                        val dist = maxOf(
+                            abs(Color.red(c) - bgR),
+                            abs(Color.green(c) - bgG),
+                            abs(Color.blue(c) - bgB)
+                        )
+                        (((dist - 30) / 80f).coerceIn(0f, 1f) * a0).toInt()
+                    }
+                    else -> a0
+                }
+                out[y * s + x] = Color.argb(a, 255, 255, 255)
+                if (a > 60) {
+                    on++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        // Kosong atau terlalu penuh (jadi gumpalan putih) -> tidak ditampilkan
+        if (maxX < 0 || on > (s * s * 0.5f).toInt()) return null
+
+        val bw = maxX - minX + 1
+        val bh = maxY - minY + 1
+        val side = maxOf(bw, bh)
+        val dest = side + side / 6
+        val glyph = Bitmap.createBitmap(out, s, s, Bitmap.Config.ARGB_8888)
+        val result = Bitmap.createBitmap(dest, dest, Bitmap.Config.ARGB_8888)
+        val left = (dest - bw) / 2
+        val top = (dest - bh) / 2
+        Canvas(result).drawBitmap(
+            glyph,
+            Rect(minX, minY, maxX + 1, maxY + 1),
+            Rect(left, top, left + bw, top + bh),
+            Paint(Paint.FILTER_BITMAP_FLAG)
+        )
+        return result
+    }
+
+    // ---------- Aksi ----------
+
+    private fun launch(app: App, v: View) {
         try {
-            packageManager.getLaunchIntentForPackage(app.pkg)?.let { startActivity(it) }
+            val i = packageManager.getLaunchIntentForPackage(app.pkg) ?: return
+            val opts = ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height)
+            startActivity(i, opts.toBundle())
         } catch (e: Exception) {
             toast("Tidak bisa membuka ${app.label}")
         }
@@ -260,7 +383,7 @@ class MainActivity : Activity() {
     }
 
     private fun row(app: App, iconMode: Int, textSp: Float): View {
-        val padV = dp(if (iconMode != 0) 8 else 10)
+        val padV = dp(if (iconMode != 0) 9 else 10)
         val r = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -270,23 +393,15 @@ class MainActivity : Activity() {
         }
         if (iconMode != 0) {
             val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
             try {
-                val d = packageManager.getApplicationIcon(app.pkg)
                 if (iconMode == 2) {
-                    // monokrom: pakai lapisan depan ikon adaptif, diwarnai putih
-                    if (d is AdaptiveIconDrawable) {
-                        iv.setImageDrawable(d.foreground ?: d)
-                        iv.scaleX = 1.5f
-                        iv.scaleY = 1.5f
-                    } else {
-                        iv.setImageDrawable(d)
-                    }
-                    iv.setColorFilter(whiteFilter)
+                    monoIcon(app.pkg)?.let { iv.setImageBitmap(it) }
                 } else {
-                    iv.setImageDrawable(d)
+                    iv.setImageDrawable(packageManager.getApplicationIcon(app.pkg))
                 }
             } catch (e: Exception) { /* abaikan */ }
-            r.addView(iv, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(18) })
+            r.addView(iv, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(20) })
         }
         r.addView(TextView(this).apply {
             text = app.label
@@ -296,8 +411,18 @@ class MainActivity : Activity() {
             ellipsize = TextUtils.TruncateAt.END
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         })
-        r.setOnClickListener { launch(app) }
+        r.setOnClickListener { launch(app, r) }
         r.setOnLongClickListener { showMenu(app); true }
+        r.post { r.pivotX = 0f; r.pivotY = r.height / 2f }
+        r.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN ->
+                    v.animate().alpha(0.55f).scaleX(0.97f).scaleY(0.97f).setDuration(80).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    v.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).start()
+            }
+            false
+        }
         return r
     }
 
@@ -321,7 +446,7 @@ class MainActivity : Activity() {
             opts.add("Sembunyikan" to {
                 hidden = hidden + app.pkg
                 favs = favs - app.pkg
-                toast("${app.label} disembunyikan. Buka lewat tombol 🔒")
+                toast("${app.label} disembunyikan. Buka lewat ikon gembok di bawah huruf")
                 renderCurrent()
             })
         } else {
@@ -343,20 +468,14 @@ class MainActivity : Activity() {
 
     // Pengaturan (tekan lama jam / area kosong)
     private fun showSettings() {
-        val items = arrayOf(
-            "Gaya ikon favorit",
-            "Kegelapan wallpaper",
-            "Atur launcher default",
-            "Pengaturan sistem"
-        )
+        val items = arrayOf("Gaya ikon", "Atur launcher default", "Pengaturan sistem")
         AlertDialog.Builder(this)
             .setTitle("Pengaturan")
             .setItems(items) { _, i ->
                 when (i) {
                     0 -> pickIconStyle()
-                    1 -> pickDim()
-                    2 -> openSafe(Intent(Settings.ACTION_HOME_SETTINGS))
-                    3 -> openSafe(Intent(Settings.ACTION_SETTINGS))
+                    1 -> openSafe(Intent(Settings.ACTION_HOME_SETTINGS))
+                    2 -> openSafe(Intent(Settings.ACTION_SETTINGS))
                 }
             }
             .show()
@@ -364,7 +483,7 @@ class MainActivity : Activity() {
 
     private fun pickIconStyle() {
         AlertDialog.Builder(this)
-            .setTitle("Gaya ikon favorit")
+            .setTitle("Gaya ikon")
             .setSingleChoiceItems(
                 arrayOf("Tanpa ikon", "Ikon warna", "Ikon monokrom (putih)"), iconStyle
             ) { d, which ->
@@ -375,17 +494,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun pickDim() {
-        val values = intArrayOf(90, 150, 210)
-        AlertDialog.Builder(this)
-            .setTitle("Kegelapan wallpaper")
-            .setSingleChoiceItems(arrayOf("Terang", "Sedang", "Gelap"), values.indexOf(dim)) { d, which ->
-                dim = values[which]
-                root.setBackgroundColor(Color.argb(dim, 0, 0, 0))
-                d.dismiss()
-            }
-            .show()
-    }
+    // ---------- Tampilan daftar ----------
 
     private fun showKey(idx: Int) {
         when (val k = keys[idx]) {
@@ -405,7 +514,7 @@ class MainActivity : Activity() {
 
     private fun showFavorites() {
         viewMode = 0
-        header.visibility = View.VISIBLE
+        showHeader(true)
         list.gravity = Gravity.BOTTOM
         list.removeAllViews()
         scroll.scrollTo(0, 0)
@@ -420,34 +529,38 @@ class MainActivity : Activity() {
         }
         val mode = iconStyle
         items.forEach { app ->
-            list.addView(row(app, mode, if (mode == 0) 26f else 22f))
+            list.addView(row(app, mode, if (mode == 0) 24f else 20f))
         }
+        animateRows()
     }
 
     private fun showLetter(c: Char) {
         viewMode = 1
         viewLetter = c
-        header.visibility = View.INVISIBLE
+        showHeader(false)
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)
+        val mode = iconStyle
         visibleApps().filter {
             val f = it.label.firstOrNull()?.uppercaseChar() ?: '#'
             if (c == '#') f !in 'A'..'Z' else f == c
         }.forEach { app ->
-            list.addView(row(app, 1, 18f))
+            list.addView(row(app, mode, 18f))
         }
+        animateRows()
     }
 
     private fun showHidden() {
         viewMode = 2
-        header.visibility = View.INVISIBLE
+        showHeader(false)
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)
         list.addView(TextView(this).apply {
-            text = "🔒 Aplikasi tersembunyi"
+            text = "Aplikasi tersembunyi"
             textSize = 14f
+            letterSpacing = 0.1f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, dp(8))
         })
@@ -460,6 +573,8 @@ class MainActivity : Activity() {
                 setTextColor(Color.LTGRAY)
             })
         }
-        items.forEach { app -> list.addView(row(app, 1, 18f)) }
+        val mode = iconStyle
+        items.forEach { app -> list.addView(row(app, mode, 18f)) }
+        animateRows()
     }
 }

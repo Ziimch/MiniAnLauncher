@@ -54,6 +54,8 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var header: LinearLayout
     private lateinit var greeting: TextView
+    private lateinit var clockTime: TextClock
+    private lateinit var clockDate: TextClock
     private lateinit var pill: TextView
     private lateinit var bigLetter: TextView
     private var bigShown: Char? = null
@@ -96,6 +98,22 @@ class MainActivity : Activity() {
         get() = hiddenCache ?: readList("hidden").also { hiddenCache = it }
         set(v) { hiddenCache = v; writeList("hidden", v) }
 
+    private val clockNames = listOf("Tipis", "Tebal", "Ringkas")
+    private val bgNames = listOf("Hitam polos", "Wallpaper redup", "Wallpaper jernih")
+    private val iconNames = listOf("Tanpa ikon", "Ikon warna", "Monokrom")
+
+    private var clockStyle: Int
+        get() = prefs.getInt("clock", 0).coerceIn(0, 2)
+        set(v) { prefs.edit().putInt("clock", v).apply() }
+
+    private var bgMode: Int
+        get() = prefs.getInt("bg", 0).coerceIn(0, 2)
+        set(v) { prefs.edit().putInt("bg", v).apply() }
+
+    private var showInfo: Boolean
+        get() = prefs.getBoolean("info", false)
+        set(v) { prefs.edit().putBoolean("info", v).apply() }
+
     private var hideStatus: Boolean
         get() = prefs.getBoolean("hide_status", true)
         set(v) { prefs.edit().putBoolean("hide_status", v).apply() }
@@ -136,24 +154,15 @@ class MainActivity : Activity() {
             setPadding(dp(4), 0, 0, dp(2))
         }
         header.addView(greeting)
-        header.addView(TextClock(this).apply {
-            format24Hour = "HH:mm"
-            format12Hour = "hh:mm"
-            textSize = 72f
+        clockTime = TextClock(this).apply {
             includeFontPadding = false
-            typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
             setTextColor(Color.WHITE)
-        })
-        header.addView(TextClock(this).apply {
-            format24Hour = "EEEE  ·  d MMMM"
-            format12Hour = "EEEE  ·  d MMMM"
-            textSize = 13f
-            letterSpacing = 0.16f
-            setAllCaps(true)
-            setTextColor(Color.argb(200, 255, 255, 255))
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setPadding(dp(4), dp(4), 0, 0)
-        })
+        }
+        clockDate = TextClock(this).apply {
+            setTextColor(Color.argb(210, 255, 255, 255))
+        }
+        header.addView(clockTime)
+        header.addView(clockDate)
         batteryFillBg = GradientDrawable().apply {
             setColor(Color.WHITE)
             cornerRadius = dp(2).toFloat()
@@ -188,6 +197,8 @@ class MainActivity : Activity() {
         header.getChildAt(1).setOnLongClickListener { showSettings(); true }
         header.getChildAt(2).setOnClickListener { openCalendar() }
         header.getChildAt(2).setOnLongClickListener { showSettings(); true }
+        applyClockStyle()
+        applyHeaderOptions()
         root.addView(header, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
@@ -301,6 +312,7 @@ class MainActivity : Activity() {
 
         setContentView(root)
         applySystemUi()
+        applyBackground()
     }
 
     // ---------- Gesek ke bawah: panel notifikasi ----------
@@ -353,6 +365,73 @@ class MainActivity : Activity() {
         contentDescription = desc
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp(16), dp(5), dp(16), dp(5))
+    }
+
+    // Gaya jam: Tipis (bawaan), Tebal (serif seperti layar kunci), Ringkas
+    private fun applyClockStyle() {
+        when (clockStyle) {
+            1 -> {
+                clockTime.format24Hour = "HH.mm"
+                clockTime.format12Hour = "hh.mm"
+                clockTime.textSize = 76f
+                clockTime.letterSpacing = 0f
+                clockTime.typeface = Typeface.create("serif", Typeface.BOLD)
+                clockDate.format24Hour = "EEE, d MMM"
+                clockDate.format12Hour = "EEE, d MMM"
+                clockDate.textSize = 18f
+                clockDate.letterSpacing = 0f
+                clockDate.setAllCaps(false)
+                clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            }
+            2 -> {
+                clockTime.format24Hour = "HH:mm"
+                clockTime.format12Hour = "hh:mm"
+                clockTime.textSize = 44f
+                clockTime.letterSpacing = 0f
+                clockTime.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+                clockDate.format24Hour = "EEE, d MMM"
+                clockDate.format12Hour = "EEE, d MMM"
+                clockDate.textSize = 15f
+                clockDate.letterSpacing = 0.02f
+                clockDate.setAllCaps(false)
+                clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            }
+            else -> {
+                clockTime.format24Hour = "HH:mm"
+                clockTime.format12Hour = "hh:mm"
+                clockTime.textSize = 72f
+                clockTime.letterSpacing = 0f
+                clockTime.typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                clockDate.format24Hour = "EEEE  ·  d MMMM"
+                clockDate.format12Hour = "EEEE  ·  d MMMM"
+                clockDate.textSize = 13f
+                clockDate.letterSpacing = 0.16f
+                clockDate.setAllCaps(true)
+                clockDate.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            }
+        }
+        clockDate.setPadding(dp(4), dp(4), 0, 0)
+    }
+
+    // Sapaan & baterai hanya tampil jika diaktifkan (bawaan: mati agar beranda simpel)
+    private fun applyHeaderOptions() {
+        val v = if (showInfo) View.VISIBLE else View.GONE
+        greeting.visibility = v
+        header.getChildAt(3).visibility = v
+    }
+
+    // Latar: hitam polos, atau wallpaper sistem dengan lapisan gelap
+    @Suppress("DEPRECATION")
+    private fun applyBackground() {
+        if (bgMode == 0) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
+            window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+            root.setBackgroundColor(Color.TRANSPARENT)
+        } else {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
+            window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            root.setBackgroundColor(Color.argb(if (bgMode == 1) 150 else 55, 0, 0, 0))
+        }
     }
 
     // Status bar disembunyikan (geser dari tepi atas untuk memunculkannya sementara)
@@ -1006,34 +1085,57 @@ class MainActivity : Activity() {
 
     // Pengaturan (tekan lama jam / area kosong)
     private fun showSettings() {
-        val styleName = when (iconStyle) {
-            0 -> "Tanpa ikon"
-            1 -> "Warna"
-            else -> "Monokrom"
-        }
+        fun onOff(b: Boolean) = if (b) "Aktif" else "Mati"
         showSheet("Pengaturan", null, listOf(
-            Entry(0, "Gaya ikon", styleName) { pickIconStyle() },
-            Entry(0, "Getaran saat geser huruf", if (haptic) "Aktif" else "Mati") {
+            Entry(0, "Gaya jam", clockNames[clockStyle]) {
+                pickOption("Gaya jam", clockNames, clockStyle) {
+                    clockStyle = it
+                    applyClockStyle()
+                }
+            },
+            Entry(0, "Latar", bgNames[bgMode]) {
+                pickOption("Latar", bgNames, bgMode) {
+                    bgMode = it
+                    applyBackground()
+                }
+            },
+            Entry(0, "Gaya ikon", iconNames[iconStyle.coerceIn(0, 2)]) {
+                pickOption("Gaya ikon", iconNames, iconStyle) {
+                    iconStyle = it
+                    renderCurrent()
+                    if (it != 0) precomputeIcons()
+                }
+            },
+            Entry(0, "Sapaan & baterai", onOff(showInfo)) {
+                showInfo = !showInfo
+                applyHeaderOptions()
+                showSettings()
+            },
+            Entry(0, "Getaran saat geser huruf", onOff(haptic)) {
                 haptic = !haptic
                 showSettings()
             },
-            Entry(0, "Sembunyikan status bar", if (hideStatus) "Aktif" else "Mati") {
+            Entry(0, "Sembunyikan status bar", onOff(hideStatus)) {
                 hideStatus = !hideStatus
                 applySystemUi()
                 showSettings()
             },
-            Entry(0, "Atur launcher default") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) },
-            Entry(0, "Pengaturan sistem") { openSafe(Intent(Settings.ACTION_SETTINGS)) }
+            Entry(0, "Ganti wallpaper") {
+                openSafe(
+                    Intent.createChooser(Intent(Intent.ACTION_SET_WALLPAPER), "Pilih wallpaper"),
+                    "Tidak bisa membuka pilihan wallpaper"
+                )
+            },
+            Entry(0, "Atur launcher default") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) }
         ))
     }
 
-    private fun pickIconStyle() {
-        val names = listOf("Tanpa ikon", "Ikon warna", "Ikon monokrom (putih)")
-        showSheet("Gaya ikon", null, names.mapIndexed { i, n ->
-            Entry(if (i == iconStyle) R.drawable.ic_check else -1, n) {
-                iconStyle = i
-                renderCurrent()
-                if (i != 0) precomputeIcons()
+    // Daftar pilihan dengan centang; setelah memilih kembali ke Pengaturan
+    private fun pickOption(title: String, names: List<String>, current: Int, onPick: (Int) -> Unit) {
+        showSheet(title, null, names.mapIndexed { i, n ->
+            Entry(if (i == current) R.drawable.ic_check else -1, n) {
+                onPick(i)
+                showSettings()
             }
         })
     }

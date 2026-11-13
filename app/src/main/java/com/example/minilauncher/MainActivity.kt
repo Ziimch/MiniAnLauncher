@@ -10,11 +10,13 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -93,27 +95,28 @@ class MainActivity : Activity() {
             insets
         }
 
-        // Jam: hari besar & tipis + jam kecil
+        // Jam besar & tipis, tanggal kecil di bawahnya
         header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(28), dp(40), 0, 0)
+            setPadding(dp(28), dp(36), 0, 0)
             setOnLongClickListener { showSettings(); true }
         }
         header.addView(TextClock(this).apply {
-            format24Hour = "EEE"
-            format12Hour = "EEE"
-            textSize = 76f
-            setAllCaps(true)
+            format24Hour = "HH:mm"
+            format12Hour = "hh:mm"
+            textSize = 68f
             includeFontPadding = false
             typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
             setTextColor(Color.WHITE)
         })
         header.addView(TextClock(this).apply {
-            format24Hour = "HH:mm"
-            format12Hour = "hh:mm"
-            textSize = 18f
-            letterSpacing = 0.2f
-            setTextColor(Color.WHITE)
+            format24Hour = "EEEE, d MMMM"
+            format12Hour = "EEEE, d MMMM"
+            textSize = 16f
+            letterSpacing = 0.04f
+            setTextColor(Color.argb(190, 255, 255, 255))
+            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            setPadding(dp(4), dp(2), 0, 0)
         })
         root.addView(header, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -146,27 +149,32 @@ class MainActivity : Activity() {
                 KEY_HIDDEN -> iconKey(R.drawable.ic_lock)
                 else -> TextView(this).apply {
                     text = k
-                    textSize = 11f
+                    textSize = 10.5f
                     gravity = Gravity.CENTER
                     setTextColor(Color.WHITE)
                 }
             }
+            v.alpha = 0.75f
             strip.addView(v, LinearLayout.LayoutParams(dp(44), 0, 1f))
         }
+        curW = FloatArray(keys.size)
         strip.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                     val pos = (e.y / v.height * keys.size).coerceIn(0f, keys.size - 0.001f)
-                    fisheye(pos)
+                    touchPos = pos
+                    startFrames()
                     val idx = pos.toInt()
                     if (idx != currentKey) {
                         currentKey = idx
+                        v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         showKey(idx)
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     currentKey = -1
-                    resetFisheye()
+                    touchPos = -1f
+                    startFrames()
                 }
             }
             true
@@ -179,6 +187,48 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    // ---------- Gesek ke bawah: panel notifikasi ----------
+
+    private var downX = 0f
+    private var downY = 0f
+    private var swipeTracking = false
+    private var swipeDone = false
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.rawX
+                downY = ev.rawY
+                swipeDone = false
+                // abaikan sentuhan yang dimulai di strip huruf
+                swipeTracking = ev.rawX < resources.displayMetrics.widthPixels - dp(48)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (swipeTracking && !swipeDone) {
+                    val dy = ev.rawY - downY
+                    val dx = abs(ev.rawX - downX)
+                    // hanya jika daftar sudah di posisi paling atas (tidak sedang di-scroll)
+                    if (dy > dp(70) && dy > dx * 1.5f && !scroll.canScrollVertically(-1)) {
+                        swipeDone = true
+                        expandNotifications()
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun expandNotifications() {
+        try {
+            val sbs = getSystemService("statusbar")
+            Class.forName("android.app.StatusBarManager")
+                .getMethod("expandNotificationsPanel")
+                .invoke(sbs)
+        } catch (e: Exception) {
+            toast("Tidak bisa membuka panel notifikasi")
+        }
+    }
+
     private fun iconKey(res: Int): View = ImageView(this).apply {
         setImageResource(res)
         scaleType = ImageView.ScaleType.CENTER_INSIDE
@@ -189,6 +239,7 @@ class MainActivity : Activity() {
         super.onResume()
         loadApps()
         showFavorites()
+        precomputeIcons()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -224,36 +275,49 @@ class MainActivity : Activity() {
 
     // ---------- Animasi ----------
 
-    // Efek lengkung ala Niagara: huruf dekat jari bergeser ke kiri & membesar, halus
-    private fun fisheye(pos: Float) {
-        for (i in 0 until strip.childCount) {
-            val c = strip.getChildAt(i)
-            val d = abs(i + 0.5f - pos)
-            val w = exp(-d * d / 6f)
-            c.animate()
-                .translationX(-dp(44) * w)
-                .scaleX(1f + 0.9f * w)
-                .scaleY(1f + 0.9f * w)
-                .alpha(0.4f + 0.6f * w)
-                .setDuration(70)
-                .setInterpolator(DecelerateInterpolator())
-                .start()
+    // Efek lengkung ala Niagara. Satu loop per frame yang menggeser nilai pelan-pelan
+    // menuju target, jadi halus dan ringan (tidak membuat puluhan animator tiap sentuhan).
+    private var touchPos = -1f
+    private var curW = FloatArray(0)
+    private var act = 0f
+    private var frameRunning = false
+
+    private val frame = object : Runnable {
+        override fun run() {
+            val touching = touchPos >= 0f
+            var moving = false
+            val actDiff = (if (touching) 1f else 0f) - act
+            act += actDiff * 0.3f
+            if (abs(actDiff) > 0.004f) moving = true else act = if (touching) 1f else 0f
+            val base = 0.75f - 0.4f * act
+            for (i in 0 until strip.childCount) {
+                val d = abs(i + 0.5f - touchPos)
+                val target = if (touching) exp(-d * d / 6f) else 0f
+                val diff = target - curW[i]
+                curW[i] += diff * 0.4f
+                if (abs(diff) > 0.004f) moving = true else curW[i] = target
+                val w = curW[i]
+                val c = strip.getChildAt(i)
+                c.translationX = -dp(44) * w
+                val sc = 1f + 0.9f * w
+                c.scaleX = sc
+                c.scaleY = sc
+                c.alpha = base + (1f - base) * w
+            }
+            if (moving || touching) strip.postOnAnimation(this) else frameRunning = false
         }
     }
 
-    private fun resetFisheye() {
-        for (i in 0 until strip.childCount) {
-            strip.getChildAt(i).animate()
-                .translationX(0f).scaleX(1f).scaleY(1f).alpha(1f)
-                .setDuration(280)
-                .setInterpolator(OvershootInterpolator(1.4f))
-                .start()
+    private fun startFrames() {
+        if (!frameRunning) {
+            frameRunning = true
+            strip.postOnAnimation(frame)
         }
     }
 
     // Baris muncul bergantian: fade + geser dari kanan
     private fun animateRows() {
-        for (i in 0 until list.childCount) {
+        for (i in 0 until minOf(list.childCount, 8)) {
             val v = list.getChildAt(i)
             v.alpha = 0f
             v.translationX = dp(20).toFloat()
@@ -272,13 +336,39 @@ class MainActivity : Activity() {
 
     // ---------- Ikon monokrom ----------
 
-    private val monoCache = HashMap<String, Bitmap?>()
+    private val monoCache = java.util.concurrent.ConcurrentHashMap<String, Any>()
+    private val colorCache = java.util.concurrent.ConcurrentHashMap<String, Drawable.ConstantState>()
+    private val NONE = Any()
 
     private fun monoIcon(pkg: String): Bitmap? {
-        if (monoCache.containsKey(pkg)) return monoCache[pkg]
+        val c = monoCache[pkg]
+        if (c != null) return c as? Bitmap
         val bmp = try { buildMono(pkg) } catch (e: Exception) { null }
-        monoCache[pkg] = bmp
+        monoCache[pkg] = bmp ?: NONE
         return bmp
+    }
+
+    private fun colorIcon(pkg: String): Drawable? {
+        val cs = colorCache[pkg]
+        if (cs != null) return cs.newDrawable()
+        val d = packageManager.getApplicationIcon(pkg)
+        d.constantState?.let { colorCache[pkg] = it }
+        return d
+    }
+
+    // Siapkan ikon di latar belakang supaya menggeser huruf tidak tersendat
+    private fun precomputeIcons() {
+        val pkgs = apps.map { it.pkg }
+        val style = iconStyle
+        if (style == 0) return
+        Thread {
+            Thread.currentThread().priority = Thread.MIN_PRIORITY
+            for (p in pkgs) {
+                try {
+                    if (style == 2) monoIcon(p) else colorIcon(p)
+                } catch (e: Exception) { /* abaikan */ }
+            }
+        }.start()
     }
 
     // Ubah ikon jadi siluet putih: latar ikon dibuang, hanya simbolnya yang tersisa
@@ -398,7 +488,7 @@ class MainActivity : Activity() {
                 if (iconMode == 2) {
                     monoIcon(app.pkg)?.let { iv.setImageBitmap(it) }
                 } else {
-                    iv.setImageDrawable(packageManager.getApplicationIcon(app.pkg))
+                    iv.setImageDrawable(colorIcon(app.pkg))
                 }
             } catch (e: Exception) { /* abaikan */ }
             r.addView(iv, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(20) })
@@ -542,12 +632,25 @@ class MainActivity : Activity() {
         list.removeAllViews()
         scroll.scrollTo(0, 0)
         val mode = iconStyle
-        visibleApps().filter {
+        list.addView(TextView(this).apply {
+            text = c.toString()
+            textSize = 13f
+            letterSpacing = 0.15f
+            setTextColor(Color.argb(150, 255, 255, 255))
+            setPadding(0, 0, 0, dp(6))
+        })
+        val matches = visibleApps().filter {
             val f = it.label.firstOrNull()?.uppercaseChar() ?: '#'
             if (c == '#') f !in 'A'..'Z' else f == c
-        }.forEach { app ->
-            list.addView(row(app, mode, 18f))
         }
+        if (matches.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "Tidak ada aplikasi"
+                textSize = 14f
+                setTextColor(Color.GRAY)
+            })
+        }
+        matches.forEach { app -> list.addView(row(app, mode, 18f)) }
         animateRows()
     }
 

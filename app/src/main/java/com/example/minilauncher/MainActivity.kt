@@ -1,6 +1,7 @@
 package com.example.minilauncher
 
 import android.app.Activity
+import android.app.Dialog
 import android.app.ActivityOptions
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
@@ -14,8 +15,10 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Bundle
@@ -27,6 +30,8 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
@@ -47,6 +52,7 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var header: LinearLayout
     private lateinit var greeting: TextView
+    private lateinit var pill: TextView
     private lateinit var batteryText: TextView
     private lateinit var batteryFill: View
     private lateinit var batteryFillBg: GradientDrawable
@@ -83,6 +89,10 @@ class MainActivity : Activity() {
         get() = readList("hidden")
         set(v) = writeList("hidden", v)
 
+    private var hideStatus: Boolean
+        get() = prefs.getBoolean("hide_status", true)
+        set(v) { prefs.edit().putBoolean("hide_status", v).apply() }
+
     private var haptic: Boolean
         get() = prefs.getBoolean("haptic", true)
         set(v) { prefs.edit().putBoolean("haptic", v).apply() }
@@ -95,18 +105,14 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-
         root = FrameLayout(this)
         root.clipChildren = false
         root.setBackgroundColor(Color.BLACK)
         root.setOnClickListener { showFavorites() }
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
-            v.setPadding(0, insets.systemWindowInsetTop, 0, insets.systemWindowInsetBottom)
+            val cut = insets.displayCutout?.safeInsetTop ?: 0
+            v.setPadding(0, maxOf(insets.systemWindowInsetTop, cut), 0, insets.systemWindowInsetBottom)
             insets
         }
 
@@ -250,7 +256,27 @@ class MainActivity : Activity() {
             topMargin = dp(120); bottomMargin = dp(32)
         })
 
+        pill = TextView(this).apply {
+            textSize = 14f
+            maxWidth = dp(300)
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(dp(18), dp(10), dp(18), dp(10))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#2C2C2E"))
+                cornerRadius = dp(22).toFloat()
+            }
+            alpha = 0f
+        }
+        root.addView(pill, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(28)
+        })
+
         setContentView(root)
+        applySystemUi()
     }
 
     // ---------- Gesek ke bawah: panel notifikasi ----------
@@ -285,14 +311,17 @@ class MainActivity : Activity() {
     }
 
     private fun expandNotifications() {
-        try {
-            val sbs = getSystemService("statusbar")
-            Class.forName("android.app.StatusBarManager")
-                .getMethod("expandNotificationsPanel")
-                .invoke(sbs)
-        } catch (e: Exception) {
-            toast("Tidak bisa membuka panel notifikasi")
+        val sbs = getSystemService("statusbar")
+        val cls = try { Class.forName("android.app.StatusBarManager") } catch (e: Exception) { null }
+        if (sbs != null && cls != null) {
+            for (name in arrayOf("expandNotificationsPanel", "expand")) {
+                try {
+                    cls.getMethod(name).invoke(sbs)
+                    return
+                } catch (e: Exception) { /* coba cara berikutnya */ }
+            }
         }
+        toast("Tidak bisa membuka panel notifikasi")
     }
 
     private fun iconKey(res: Int, desc: String): View = ImageView(this).apply {
@@ -300,6 +329,24 @@ class MainActivity : Activity() {
         contentDescription = desc
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp(16), dp(5), dp(16), dp(5))
+    }
+
+    // Status bar disembunyikan (geser dari tepi atas untuk memunculkannya sementara)
+    @Suppress("DEPRECATION")
+    private fun applySystemUi() {
+        var f = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        if (hideStatus) {
+            f = f or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        }
+        window.decorView.systemUiVisibility = f
+        header.setPadding(dp(28), dp(if (hideStatus) 44 else 32), 0, 0)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applySystemUi()
     }
 
     private val batteryReceiver = object : BroadcastReceiver() {
@@ -590,7 +637,22 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    private val hidePill = Runnable {
+        pill.animate().alpha(0f).translationY(dp(12).toFloat()).setDuration(200).start()
+    }
+
+    private fun toast(msg: String) {
+        pill.removeCallbacks(hidePill)
+        pill.animate().cancel()
+        pill.text = msg
+        pill.translationY = dp(12).toFloat()
+        pill.animate()
+            .alpha(1f).translationY(0f)
+            .setDuration(200)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+        pill.postDelayed(hidePill, 2000)
+    }
 
     private fun openSafe(intent: Intent, err: String = "Tidak bisa membuka pengaturan") {
         try {
@@ -688,85 +750,206 @@ class MainActivity : Activity() {
         return r
     }
 
+    // ---------- Lembar menu (bottom sheet) ----------
+
+    // icon: 0 = tanpa ikon, -1 = ruang kosong sebesar ikon, selain itu id drawable
+    private class Entry(
+        val icon: Int,
+        val label: String,
+        val value: String? = null,
+        val danger: Boolean = false,
+        val action: () -> Unit
+    )
+
+    private fun pressBg(): Drawable = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_pressed), GradientDrawable().apply {
+            setColor(Color.parseColor("#2C2C2E"))
+            cornerRadius = dp(18).toFloat()
+        })
+        addState(intArrayOf(), ColorDrawable(Color.TRANSPARENT))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun showSheet(title: String, titleIcon: Drawable?, entries: List<Entry>) {
+        val dlg = Dialog(this)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1C1C1E"))
+                cornerRadius = dp(28).toFloat()
+            }
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(14))
+        }
+        if (titleIcon != null) {
+            head.addView(ImageView(this).apply { setImageDrawable(titleIcon) },
+                LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(14) })
+        }
+        head.addView(TextView(this).apply {
+            text = title
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        card.addView(head)
+        card.addView(View(this).apply { setBackgroundColor(Color.parseColor("#2C2C2E")) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                setMargins(dp(8), 0, dp(8), dp(6))
+            })
+
+        entries.forEach { e ->
+            val color = if (e.danger) Color.parseColor("#FF6B6B") else Color.WHITE
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(54)
+                setPadding(dp(16), 0, dp(16), 0)
+                background = pressBg()
+                setOnClickListener {
+                    dlg.dismiss()
+                    e.action()
+                }
+            }
+            if (e.icon != 0) {
+                val iv = ImageView(this)
+                if (e.icon > 0) {
+                    iv.setImageResource(e.icon)
+                    iv.setColorFilter(if (e.danger) color else Color.argb(230, 255, 255, 255))
+                }
+                row.addView(iv, LinearLayout.LayoutParams(dp(22), dp(22)).apply { marginEnd = dp(18) })
+            }
+            row.addView(TextView(this).apply {
+                text = e.label
+                textSize = 16f
+                setTextColor(color)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (e.value != null) {
+                row.addView(TextView(this).apply {
+                    text = e.value
+                    textSize = 14f
+                    setTextColor(Color.argb(150, 255, 255, 255))
+                })
+            }
+            card.addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(12), 0, dp(12), dp(12))
+            addView(card, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        dlg.setContentView(wrap)
+        dlg.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setGravity(Gravity.BOTTOM)
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            setDimAmount(0.7f)
+            // tidak fokus dulu agar status bar tidak muncul sekejap saat dialog tampil
+            setFlags(
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            )
+        }
+        dlg.setCanceledOnTouchOutside(true)
+        card.alpha = 0f
+        card.translationY = dp(40).toFloat()
+        dlg.show()
+        dlg.window?.let { w ->
+            w.decorView.systemUiVisibility = window.decorView.systemUiVisibility
+            w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        }
+        card.animate()
+            .alpha(1f).translationY(0f)
+            .setDuration(220)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+    }
+
     // Menu tekan-lama pada aplikasi
     private fun showMenu(app: App) {
         val isHidden = app.pkg in hidden
         val isFav = app.pkg in favs
-        val opts = mutableListOf<Pair<String, () -> Unit>>()
+        val es = mutableListOf<Entry>()
         if (!isHidden) {
             if (isFav) {
-                opts.add("Hapus dari favorit" to {
+                es.add(Entry(R.drawable.ic_star_border, "Hapus dari favorit") {
                     favs = favs - app.pkg
                     renderCurrent()
                 })
             } else {
-                opts.add("Tambah ke favorit" to {
+                es.add(Entry(R.drawable.ic_star, "Tambah ke favorit") {
                     favs = favs + app.pkg
                     toast("${app.label} ditambah ke favorit")
                 })
             }
-            opts.add("Sembunyikan" to {
+            es.add(Entry(R.drawable.ic_visibility_off, "Sembunyikan") {
                 hidden = hidden + app.pkg
                 favs = favs - app.pkg
                 toast("${app.label} disembunyikan. Buka lewat ikon gembok di bawah huruf")
                 renderCurrent()
             })
         } else {
-            opts.add("Tampilkan kembali" to {
+            es.add(Entry(R.drawable.ic_visibility, "Tampilkan kembali") {
                 hidden = hidden - app.pkg
                 toast("${app.label} ditampilkan kembali")
                 renderCurrent()
             })
         }
-        opts.add("Info aplikasi" to {
+        es.add(Entry(R.drawable.ic_info, "Info aplikasi") {
             openSafe(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                 Uri.parse("package:" + app.pkg)))
         })
-        opts.add("Copot pemasangan" to {
+        es.add(Entry(R.drawable.ic_delete, "Copot pemasangan", danger = true) {
             openSafe(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.pkg)),
                 "Tidak bisa mencopot ${app.label}")
         })
-        showStyled(AlertDialog.Builder(this)
-            .setTitle(app.label)
-            .setItems(opts.map { it.first }.toTypedArray()) { _, i -> opts[i].second() }
-        )
+        val icon = try { colorIcon(app.pkg) } catch (e: Exception) { null }
+        showSheet(app.label, icon, es)
     }
 
     // Pengaturan (tekan lama jam / area kosong)
     private fun showSettings() {
-        val items = arrayOf(
-            "Gaya ikon",
-            "Getaran saat geser huruf: " + (if (haptic) "aktif" else "mati"),
-            "Atur launcher default",
-            "Pengaturan sistem"
-        )
-        showStyled(AlertDialog.Builder(this)
-            .setTitle("Pengaturan")
-            .setItems(items) { _, i ->
-                when (i) {
-                    0 -> pickIconStyle()
-                    1 -> {
-                        haptic = !haptic
-                        toast(if (haptic) "Getaran aktif" else "Getaran mati")
-                    }
-                    2 -> openSafe(Intent(Settings.ACTION_HOME_SETTINGS))
-                    3 -> openSafe(Intent(Settings.ACTION_SETTINGS))
-                }
-            }
-        )
+        val styleName = when (iconStyle) {
+            0 -> "Tanpa ikon"
+            1 -> "Warna"
+            else -> "Monokrom"
+        }
+        showSheet("Pengaturan", null, listOf(
+            Entry(0, "Gaya ikon", styleName) { pickIconStyle() },
+            Entry(0, "Getaran saat geser huruf", if (haptic) "Aktif" else "Mati") {
+                haptic = !haptic
+                showSettings()
+            },
+            Entry(0, "Sembunyikan status bar", if (hideStatus) "Aktif" else "Mati") {
+                hideStatus = !hideStatus
+                applySystemUi()
+                showSettings()
+            },
+            Entry(0, "Atur launcher default") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) },
+            Entry(0, "Pengaturan sistem") { openSafe(Intent(Settings.ACTION_SETTINGS)) }
+        ))
     }
 
     private fun pickIconStyle() {
-        showStyled(AlertDialog.Builder(this)
-            .setTitle("Gaya ikon")
-            .setSingleChoiceItems(
-                arrayOf("Tanpa ikon", "Ikon warna", "Ikon monokrom (putih)"), iconStyle
-            ) { d, which ->
-                iconStyle = which
-                d.dismiss()
+        val names = listOf("Tanpa ikon", "Ikon warna", "Ikon monokrom (putih)")
+        showSheet("Gaya ikon", null, names.mapIndexed { i, n ->
+            Entry(if (i == iconStyle) R.drawable.ic_check else -1, n) {
+                iconStyle = i
                 renderCurrent()
+                if (i != 0) precomputeIcons()
             }
-        )
+        })
     }
 
     // ---------- Tampilan daftar ----------

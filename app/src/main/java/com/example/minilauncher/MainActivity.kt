@@ -44,6 +44,23 @@ import android.widget.ScrollView
 import android.widget.TextClock
 import android.widget.TextView
 import android.widget.Toast
+import android.accessibilityservice.AccessibilityService
+import android.content.ComponentName
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.drawable.AdaptiveIconDrawable
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
+import android.os.Build
+import android.os.SystemClock
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.KeyEvent
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import kotlin.math.abs
 import kotlin.math.exp
 
@@ -56,6 +73,11 @@ class MainActivity : Activity() {
     private lateinit var header: LinearLayout
     private lateinit var greeting: TextView
     private lateinit var scrim: View
+    private lateinit var clockMin: TextClock
+    private lateinit var dotClock: DotClockView
+    private lateinit var nowPlaying: TextView
+    private lateinit var searchPill: LinearLayout
+    private lateinit var searchBox: EditText
     private lateinit var clockTime: TextClock
     private lateinit var clockDate: TextClock
     private lateinit var pill: TextView
@@ -73,6 +95,14 @@ class MainActivity : Activity() {
     private val iconExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var accentNow = Color.WHITE
     private var lowBattery = false
+    private var navBottom = 0
+    private var lastTapAt = 0L
+    private var searchResults: List<App> = emptyList()
+    private var nameCache: MutableMap<String, String>? = null
+    private val collator = java.text.Collator.getInstance().apply { strength = java.text.Collator.PRIMARY }
+    private var sessionMgr: MediaSessionManager? = null
+    private var controllers: List<MediaController> = emptyList()
+    private var nowController: MediaController? = null
 
     // 0 = favorit, 1 = daftar huruf, 2 = aplikasi tersembunyi
     private var viewMode = 0
@@ -105,7 +135,7 @@ class MainActivity : Activity() {
         get() = hiddenCache ?: readList("hidden").also { hiddenCache = it }
         set(v) { hiddenCache = v; writeList("hidden", v) }
 
-    private val clockNames = listOf("Tipis", "Tebal", "Ringkas")
+    private val clockNames = listOf("Ringkas", "Bertumpuk", "Dot-Matrix", "Serif")
     private val bgNames = listOf("Hitam polos", "Wallpaper redup", "Wallpaper jernih")
     private val iconNames = listOf("Tanpa ikon", "Ikon warna", "Monokrom")
 
@@ -120,12 +150,20 @@ class MainActivity : Activity() {
         set(v) { prefs.edit().putInt("accent", v).apply() }
 
     private var clockStyle: Int
-        get() = prefs.getInt("clock", 0).coerceIn(0, 2)
+        get() = prefs.getInt("clock", 0).coerceIn(0, 3)
         set(v) { prefs.edit().putInt("clock", v).apply() }
 
     private var bgMode: Int
         get() = prefs.getInt("bg", 0).coerceIn(0, 2)
         set(v) { prefs.edit().putInt("bg", v).apply() }
+
+    private var nowPlayingOn: Boolean
+        get() = prefs.getBoolean("nowplay", false)
+        set(v) { prefs.edit().putBoolean("nowplay", v).apply() }
+
+    private var dtap: Boolean
+        get() = prefs.getBoolean("dtap", false)
+        set(v) { prefs.edit().putBoolean("dtap", v).apply() }
 
     private var showInfo: Boolean
         get() = prefs.getBoolean("info", false)
@@ -149,10 +187,11 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         root = FrameLayout(this)
         root.clipChildren = false
-        root.setOnClickListener { showFavorites() }
+        root.setOnClickListener { onEmptyTap() }
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
             val cut = insets.displayCutout?.safeInsetTop ?: 0
+            navBottom = insets.stableInsetBottom
             v.setPadding(0, maxOf(insets.stableInsetTop, cut), 0, insets.stableInsetBottom)
             insets
         }
@@ -185,10 +224,26 @@ class MainActivity : Activity() {
             includeFontPadding = false
             setTextColor(Color.WHITE)
         }
+        clockMin = TextClock(this).apply {
+            includeFontPadding = false
+            setTextColor(Color.WHITE)
+            visibility = View.GONE
+        }
+        dotClock = DotClockView(this).apply { visibility = View.GONE }
+        val timeBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(clockTime)
+            addView(clockMin, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = -dp(14) })
+            addView(dotClock, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8); bottomMargin = dp(6) })
+        }
         clockDate = TextClock(this).apply {
             setTextColor(Color.argb(210, 255, 255, 255))
         }
-        header.addView(clockTime)
+        header.addView(timeBox)
         header.addView(clockDate)
         batteryFillBg = GradientDrawable().apply {
             setColor(Color.WHITE)
@@ -220,6 +275,21 @@ class MainActivity : Activity() {
             setOnLongClickListener { showSettings(); true }
         }
         header.addView(batteryRow)
+        nowPlaying = TextView(this).apply {
+            textSize = 12f
+            letterSpacing = 0.04f
+            maxLines = 1
+            maxWidth = dp(260)
+            ellipsize = TextUtils.TruncateAt.END
+            setTextColor(Color.argb(190, 255, 255, 255))
+            setPadding(dp(4), dp(2), 0, 0)
+            visibility = View.GONE
+            setOnClickListener {
+                try { nowController?.sessionActivity?.send() } catch (e: Exception) { /* abaikan */ }
+            }
+            setOnLongClickListener { showSettings(); true }
+        }
+        header.addView(nowPlaying)
         header.getChildAt(1).setOnClickListener { openClock() }
         header.getChildAt(1).setOnLongClickListener { showSettings(); true }
         header.getChildAt(2).setOnClickListener { openCalendar() }
@@ -237,7 +307,7 @@ class MainActivity : Activity() {
             overScrollMode = View.OVER_SCROLL_NEVER
             isVerticalFadingEdgeEnabled = true
             setFadingEdgeLength(dp(28))
-            setOnClickListener { showFavorites() }
+            setOnClickListener { onEmptyTap() }
             setOnLongClickListener { showSettings(); true }
             addView(list, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -298,6 +368,53 @@ class MainActivity : Activity() {
         root.addView(strip, FrameLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT).apply {
             gravity = Gravity.END
             topMargin = dp(120); bottomMargin = dp(32)
+        })
+
+        searchBox = EditText(this).apply {
+            hint = "Cari aplikasi"
+            setHintTextColor(Color.argb(120, 255, 255, 255))
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setSingleLine()
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            background = null
+            setPadding(0, 0, 0, 0)
+        }
+        searchBox.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(e: Editable?) {
+                if (viewMode == 3) safely { renderSearch() }
+            }
+        })
+        searchBox.setOnEditorActionListener { _, actionId, event ->
+            val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER &&
+                event.action == KeyEvent.ACTION_DOWN
+            if (actionId == EditorInfo.IME_ACTION_SEARCH || actionId == EditorInfo.IME_ACTION_DONE || enter) {
+                if (searchResults.size == 1) {
+                    launch(searchResults[0], list.getChildAt(0) ?: root)
+                }
+                true
+            } else {
+                false
+            }
+        }
+        searchPill = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1C1C1E"))
+                cornerRadius = dp(26).toFloat()
+                setStroke(dp(1), Color.argb(26, 255, 255, 255))
+            }
+            setPadding(dp(20), 0, dp(20), 0)
+            visibility = View.GONE
+            addView(searchBox, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        root.addView(searchPill, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+        ).apply {
+            marginStart = dp(24); marginEnd = dp(64); topMargin = dp(56)
         })
 
         bigLetter = TextView(this).apply {
@@ -363,10 +480,16 @@ class MainActivity : Activity() {
                 if (swipeTracking && !swipeDone) {
                     val dy = ev.rawY - downY
                     val dx = abs(ev.rawX - downX)
-                    // hanya jika daftar sudah di posisi paling atas (tidak sedang di-scroll)
-                    if (dy > dp(70) && dy > dx * 1.5f && !scroll.canScrollVertically(-1)) {
+                    if (dy > dp(70) && dy > dx * 1.5f && viewMode != 3 &&
+                        !scroll.canScrollVertically(-1)
+                    ) {
                         swipeDone = true
                         expandNotifications()
+                    } else if (-dy > dp(70) && -dy > dx * 1.5f && viewMode == 0 &&
+                        !scroll.canScrollVertically(1)
+                    ) {
+                        swipeDone = true
+                        openSearch()
                     }
                 }
             }
@@ -395,48 +518,51 @@ class MainActivity : Activity() {
         setPadding(dp(16), dp(5), dp(16), dp(5))
     }
 
-    // Gaya jam: Tipis (bawaan), Tebal (serif seperti layar kunci), Ringkas
+    // Gaya jam: Ringkas, Bertumpuk, Dot-Matrix, Serif
     private fun applyClockStyle() {
-        when (clockStyle) {
+        val st = clockStyle
+        clockMin.visibility = if (st == 1) View.VISIBLE else View.GONE
+        dotClock.visibility = if (st == 2) View.VISIBLE else View.GONE
+        clockTime.visibility = if (st == 2) View.GONE else View.VISIBLE
+        clockTime.letterSpacing = 0f
+        when (st) {
             1 -> {
+                clockTime.format24Hour = "HH"
+                clockTime.format12Hour = "hh"
+                clockMin.format24Hour = "mm"
+                clockMin.format12Hour = "mm"
+                clockTime.textSize = 66f
+                clockMin.textSize = 66f
+                clockTime.typeface = Typeface.create("sans-serif", Typeface.BOLD)
+                clockMin.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            }
+            3 -> {
                 clockTime.format24Hour = "HH.mm"
                 clockTime.format12Hour = "hh.mm"
                 clockTime.textSize = 76f
-                clockTime.letterSpacing = 0f
                 clockTime.typeface = Typeface.create("serif", Typeface.BOLD)
-                clockDate.format24Hour = "EEE, d MMM"
-                clockDate.format12Hour = "EEE, d MMM"
-                clockDate.textSize = 18f
-                clockDate.letterSpacing = 0f
-                clockDate.setAllCaps(false)
-                clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
-            }
-            2 -> {
-                clockTime.format24Hour = "HH:mm"
-                clockTime.format12Hour = "hh:mm"
-                clockTime.textSize = 44f
-                clockTime.letterSpacing = 0f
-                clockTime.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-                clockDate.format24Hour = "EEE, d MMM"
-                clockDate.format12Hour = "EEE, d MMM"
-                clockDate.textSize = 15f
-                clockDate.letterSpacing = 0.02f
-                clockDate.setAllCaps(false)
-                clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             }
             else -> {
                 clockTime.format24Hour = "HH:mm"
                 clockTime.format12Hour = "hh:mm"
                 clockTime.textSize = 72f
-                clockTime.letterSpacing = 0f
                 clockTime.typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
-                clockDate.format24Hour = "EEEE  ·  d MMMM"
-                clockDate.format12Hour = "EEEE  ·  d MMMM"
-                clockDate.textSize = 13f
-                clockDate.letterSpacing = 0.16f
-                clockDate.setAllCaps(true)
-                clockDate.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             }
+        }
+        if (st == 3) {
+            clockDate.format24Hour = "EEE, d MMM"
+            clockDate.format12Hour = "EEE, d MMM"
+            clockDate.textSize = 18f
+            clockDate.letterSpacing = 0f
+            clockDate.setAllCaps(false)
+            clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        } else {
+            clockDate.format24Hour = "EEEE  ·  d MMMM"
+            clockDate.format12Hour = "EEEE  ·  d MMMM"
+            clockDate.textSize = 13f
+            clockDate.letterSpacing = 0.16f
+            clockDate.setAllCaps(true)
+            clockDate.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         }
         clockDate.setPadding(dp(4), dp(4), 0, 0)
     }
@@ -455,6 +581,9 @@ class MainActivity : Activity() {
         val g = Color.green(a)
         val b = Color.blue(a)
         clockTime.setTextColor(a)
+        clockMin.setTextColor(Color.argb(120, r, g, b))
+        dotClock.dotColor = a
+        nowPlaying.setTextColor(Color.argb(190, r, g, b))
         clockDate.setTextColor(Color.argb(215, r, g, b))
         bigLetter.setTextColor(Color.argb(80, r, g, b))
         batteryFillBg.setColor(if (lowBattery) Color.parseColor("#FF6B6B") else a)
@@ -526,6 +655,7 @@ class MainActivity : Activity() {
                 iconCache.remove("m:$pkg")
                 iconCache.remove("c:$pkg")
                 noMono.remove(pkg)
+                tintable.remove(pkg)
             }
         }
     }
@@ -546,10 +676,12 @@ class MainActivity : Activity() {
         super.onStart()
         val sticky = registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         if (sticky != null) updateBattery(sticky)
+        safely { startNowPlaying() }
     }
 
     override fun onStop() {
         super.onStop()
+        safely { stopNowPlaying() }
         try { unregisterReceiver(batteryReceiver) } catch (e: Exception) { /* abaikan */ }
     }
 
@@ -746,6 +878,9 @@ class MainActivity : Activity() {
     }
     private val noMono: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    // pkg yang ikonnya berupa lapisan monokrom (diwarnai sesuai aksen saat ditampilkan)
+    private val tintable: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
     private fun monoIcon(pkg: String): Bitmap? {
         iconCache.get("m:$pkg")?.let { return it }
@@ -790,87 +925,54 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // Ubah ikon jadi siluet putih: latar ikon dibuang, hanya simbolnya yang tersisa
+    // Ikon monokrom, 3 lapis:
+    // a) Android 13+: lapisan monokrom ikon adaptif (diwarnai aksen saat ditampilkan)
+    // b) selain itu: ikon asli diubah ke grayscale kontras tinggi agar seragam
+    // c) gagal total (return null / exception): pemanggil memakai lingkaran inisial
     private fun buildMono(pkg: String): Bitmap? {
-        val s = 96
         val raw = packageManager.getApplicationIcon(pkg)
         val d = raw.constantState?.newDrawable()?.mutate() ?: raw
+        val s = 96
+
+        if (Build.VERSION.SDK_INT >= 33 && d is AdaptiveIconDrawable) {
+            val m = d.monochrome
+            if (m != null) {
+                val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                val inset = (s * 0.25f).toInt() // hanya 66% bagian tengah layer yang terlihat
+                m.setBounds(-inset, -inset, s + inset, s + inset)
+                m.draw(Canvas(b))
+                tintable.add(pkg)
+                val fin = Bitmap.createScaledBitmap(b, 64, 64, true)
+                if (fin !== b) b.recycle()
+                return fin
+            }
+        }
+
         val src = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
         d.setBounds(0, 0, s, s)
         d.draw(Canvas(src))
-        val px = IntArray(s * s)
-        src.getPixels(px, 0, s, 0, 0, s, s)
-
-        // Warna latar = nilai tengah dari beberapa titik di tepi ikon
-        val pts = arrayOf(
-            intArrayOf(50, 10), intArrayOf(50, 90), intArrayOf(10, 50), intArrayOf(90, 50),
-            intArrayOf(22, 22), intArrayOf(78, 22), intArrayOf(22, 78), intArrayOf(78, 78)
-        )
-        val rs = ArrayList<Int>()
-        val gs = ArrayList<Int>()
-        val bs = ArrayList<Int>()
-        for (p in pts) {
-            val c = px[(p[1] * s / 100) * s + (p[0] * s / 100)]
-            if (Color.alpha(c) > 220) {
-                rs.add(Color.red(c)); gs.add(Color.green(c)); bs.add(Color.blue(c))
-            }
-        }
-        val hasBg = rs.size >= 5
-        val bgR = if (hasBg) rs.sorted()[rs.size / 2] else 0
-        val bgG = if (hasBg) gs.sorted()[gs.size / 2] else 0
-        val bgB = if (hasBg) bs.sorted()[bs.size / 2] else 0
-
-        val out = IntArray(s * s)
-        var minX = s; var minY = s; var maxX = -1; var maxY = -1
-        var on = 0
-        for (y in 0 until s) {
-            for (x in 0 until s) {
-                val c = px[y * s + x]
-                val a0 = Color.alpha(c)
-                val a = when {
-                    a0 == 0 -> 0
-                    hasBg -> {
-                        val dist = maxOf(
-                            abs(Color.red(c) - bgR),
-                            abs(Color.green(c) - bgG),
-                            abs(Color.blue(c) - bgB)
-                        )
-                        (((dist - 30) / 80f).coerceIn(0f, 1f) * a0).toInt()
-                    }
-                    else -> a0
-                }
-                out[y * s + x] = Color.argb(a, 255, 255, 255)
-                if (a > 60) {
-                    on++
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
-                }
-            }
-        }
-        // Kosong atau terlalu penuh (jadi gumpalan putih) -> tidak ditampilkan
-        if (maxX < 0 || on > (s * s * 0.5f).toInt()) return null
-
-        val bw = maxX - minX + 1
-        val bh = maxY - minY + 1
-        val side = maxOf(bw, bh)
-        val dest = side + side / 6
-        val glyph = Bitmap.createBitmap(out, s, s, Bitmap.Config.ARGB_8888)
-        val result = Bitmap.createBitmap(dest, dest, Bitmap.Config.ARGB_8888)
-        val left = (dest - bw) / 2
-        val top = (dest - bh) / 2
-        Canvas(result).drawBitmap(
-            glyph,
-            Rect(minX, minY, maxX + 1, maxY + 1),
-            Rect(left, top, left + bw, top + bh),
-            Paint(Paint.FILTER_BITMAP_FLAG)
-        )
+        val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        val cm = ColorMatrix()
+        cm.setSaturation(0f)
+        val k = 1.6f
+        val t = (-0.5f * k + 0.5f) * 255f + 38f // kontras + sedikit terang agar terlihat di latar hitam
+        cm.postConcat(ColorMatrix(floatArrayOf(
+            k, 0f, 0f, 0f, t,
+            0f, k, 0f, 0f, t,
+            0f, 0f, k, 0f, t,
+            0f, 0f, 0f, 1f, 0f
+        )))
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        paint.colorFilter = ColorMatrixColorFilter(cm)
+        Canvas(out).drawBitmap(src, 0f, 0f, paint)
         src.recycle()
-        glyph.recycle()
-        val fin = Bitmap.createScaledBitmap(result, 64, 64, true)
-        if (fin !== result) result.recycle()
+        val fin = Bitmap.createScaledBitmap(out, 64, 64, true)
+        if (fin !== out) out.recycle()
         return fin
+    }
+
+    private fun tintFor(iv: ImageView, pkg: String, mode: Int) {
+        if (mode == 2 && pkg in tintable) iv.setColorFilter(accentNow) else iv.clearColorFilter()
     }
 
     // ---------- Aksi ----------
@@ -881,7 +983,7 @@ class MainActivity : Activity() {
             val opts = ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height)
             startActivity(i, opts.toBundle())
         } catch (e: Exception) {
-            toast("Tidak bisa membuka ${app.label}")
+            toast("Tidak bisa membuka ${nm(app)}")
         }
     }
 
@@ -959,10 +1061,11 @@ class MainActivity : Activity() {
         val cached = iconCache.get(key)
         if (cached != null) {
             iv.setImageBitmap(cached)
+            tintFor(iv, app.pkg, mode)
             return
         }
         if (mode == 2 && app.pkg in noMono) {
-            iv.setImageBitmap(placeholderIcon(app.label))
+            iv.setImageBitmap(placeholderIcon(nm(app)))
             return
         }
         iv.tag = app.pkg
@@ -974,7 +1077,8 @@ class MainActivity : Activity() {
                 } catch (e: Throwable) { null }
                 iv.post {
                     if (iv.tag == app.pkg) {
-                        iv.setImageBitmap(b ?: if (mode == 2) placeholderIcon(app.label) else null)
+                        iv.setImageBitmap(b ?: if (mode == 2) placeholderIcon(nm(app)) else null)
+                        tintFor(iv, app.pkg, mode)
                         iv.animate().alpha(1f).setDuration(120).start()
                     }
                 }
@@ -1001,7 +1105,7 @@ class MainActivity : Activity() {
             r.addView(iv, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(20) })
         }
         r.addView(TextView(this).apply {
-            text = app.label
+            text = nm(app)
             textSize = textSp
             setTextColor(Color.WHITE)
             maxLines = 1
@@ -1034,6 +1138,17 @@ class MainActivity : Activity() {
         val action: () -> Unit
     )
 
+    private fun blurSupported(): Boolean = Build.VERSION.SDK_INT >= 31 && try {
+        (getSystemService(Context.WINDOW_SERVICE) as WindowManager).isCrossWindowBlurEnabled
+    } catch (e: Exception) { false }
+
+    // Latar lembar: transparan (kaca) jika blur didukung, gelap pekat jika tidak; garis tepi 1dp putih 10%
+    private fun sheetBg(blur: Boolean) = GradientDrawable().apply {
+        setColor(if (blur) Color.argb(170, 28, 28, 30) else Color.argb(245, 28, 28, 30))
+        cornerRadius = dp(28).toFloat()
+        setStroke(dp(1), Color.argb(26, 255, 255, 255))
+    }
+
     private fun pressBg(): Drawable = StateListDrawable().apply {
         addState(intArrayOf(android.R.attr.state_pressed), GradientDrawable().apply {
             setColor(Color.parseColor("#2C2C2E"))
@@ -1046,13 +1161,11 @@ class MainActivity : Activity() {
     private fun showSheet(title: String, titleIcon: Drawable?, entries: List<Entry>) {
         val dlg = Dialog(this)
         dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val blur = blurSupported()
 
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#1C1C1E"))
-                cornerRadius = dp(28).toFloat()
-            }
+            background = sheetBg(blur)
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
 
@@ -1123,7 +1236,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         val wrap = FrameLayout(this).apply {
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(12), dp(12), dp(12), dp(16) + navBottom)
             addView(sv, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
@@ -1133,7 +1246,13 @@ class MainActivity : Activity() {
             setGravity(Gravity.BOTTOM)
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            setDimAmount(0.7f)
+            setDimAmount(if (blur) 0.4f else 0.7f)
+            if (blur) {
+                addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
+                val lp = attributes
+                lp.blurBehindRadius = dp(24)
+                attributes = lp
+            }
             // tidak fokus dulu agar status bar tidak muncul sekejap saat dialog tampil
             setFlags(
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
@@ -1159,6 +1278,9 @@ class MainActivity : Activity() {
     private fun showMenu(app: App) {
         val isHidden = app.pkg in hidden
         val isFav = app.pkg in favs
+        val vis = visibleApps().map { it.pkg }.toSet()
+        val vf = favs.filter { it in vis }
+        val idx = vf.indexOf(app.pkg)
         val es = mutableListOf<Entry>()
         if (!isHidden) {
             if (isFav) {
@@ -1166,22 +1288,39 @@ class MainActivity : Activity() {
                     favs = favs - app.pkg
                     renderCurrent()
                 })
+                if (idx > 0) {
+                    es.add(Entry(R.drawable.ic_arrow_up, "Geser ke atas") {
+                        moveFav(app.pkg, -1)
+                        renderCurrent()
+                        showMenu(app)
+                    })
+                }
+                if (idx >= 0 && idx < vf.size - 1) {
+                    es.add(Entry(R.drawable.ic_arrow_down, "Geser ke bawah") {
+                        moveFav(app.pkg, 1)
+                        renderCurrent()
+                        showMenu(app)
+                    })
+                }
             } else {
                 es.add(Entry(R.drawable.ic_star, "Tambah ke favorit") {
                     favs = favs + app.pkg
-                    toast("${app.label} ditambah ke favorit")
+                    toast("${nm(app)} ditambah ke favorit")
                 })
             }
+        }
+        es.add(Entry(R.drawable.ic_edit, "Ubah nama") { showRename(app) })
+        if (!isHidden) {
             es.add(Entry(R.drawable.ic_visibility_off, "Sembunyikan") {
                 hidden = hidden + app.pkg
                 favs = favs - app.pkg
-                toast("${app.label} disembunyikan. Buka lewat ikon gembok di bawah huruf")
+                toast("${nm(app)} disembunyikan. Buka lewat ikon gembok di bawah huruf")
                 renderCurrent()
             })
         } else {
             es.add(Entry(R.drawable.ic_visibility, "Tampilkan kembali") {
                 hidden = hidden - app.pkg
-                toast("${app.label} ditampilkan kembali")
+                toast("${nm(app)} ditampilkan kembali")
                 renderCurrent()
             })
         }
@@ -1191,12 +1330,24 @@ class MainActivity : Activity() {
         })
         es.add(Entry(R.drawable.ic_delete, "Copot pemasangan", danger = true) {
             openSafe(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.pkg)),
-                "Tidak bisa mencopot ${app.label}")
+                "Tidak bisa mencopot ${nm(app)}")
         })
         val icon = try {
             colorIcon(app.pkg)?.let { BitmapDrawable(resources, it) }
         } catch (e: Exception) { null }
-        showSheet(app.label, icon, es)
+        showSheet(nm(app), icon, es)
+    }
+
+    private fun moveFav(pkg: String, delta: Int) {
+        val vis = visibleApps().map { it.pkg }.toSet()
+        val l = favs.toMutableList()
+        val i = l.indexOf(pkg)
+        if (i < 0) return
+        var j = i + delta
+        while (j in l.indices && l[j] !in vis) j += delta
+        if (j !in l.indices) return
+        java.util.Collections.swap(l, i, j)
+        favs = l
     }
 
     // Pengaturan (tekan lama jam / area kosong)
@@ -1207,6 +1358,7 @@ class MainActivity : Activity() {
                 pickOption("Gaya jam", clockNames, clockStyle) {
                     clockStyle = it
                     applyClockStyle()
+                    applyAccent()
                 }
             },
             Entry(0, "Latar", bgNames[bgMode]) {
@@ -1219,6 +1371,8 @@ class MainActivity : Activity() {
                 pickOption("Warna aksen", accentNames, accentIdx) {
                     accentIdx = it
                     applyAccent()
+                    lastSig = null
+                    renderCurrent()
                 }
             },
             Entry(0, "Gaya ikon", iconNames[iconStyle.coerceIn(0, 2)]) {
@@ -1233,6 +1387,17 @@ class MainActivity : Activity() {
                 applyHeaderOptions()
                 showSettings()
             },
+            Entry(0, "Sedang diputar",
+                if (!nowPlayingOn) "Mati" else if (notifAccess()) "Aktif" else "Perlu izin") {
+                nowPlayingOn = !nowPlayingOn
+                if (nowPlayingOn && !notifAccess()) {
+                    toast("Aktifkan akses notifikasi untuk Mini Launcher")
+                    openSafe(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                } else {
+                    safely { startNowPlaying() }
+                    showSettings()
+                }
+            },
             Entry(0, "Getaran saat geser huruf", onOff(haptic)) {
                 haptic = !haptic
                 showSettings()
@@ -1241,6 +1406,16 @@ class MainActivity : Activity() {
                 hideStatus = !hideStatus
                 applySystemUi()
                 showSettings()
+            },
+            Entry(0, "Ketuk 2x untuk kunci layar",
+                if (!dtap) "Mati" else if (lockServiceEnabled()) "Aktif" else "Perlu izin") {
+                dtap = !dtap
+                if (dtap && !lockServiceEnabled()) {
+                    toast("Aktifkan layanan aksesibilitas Mini Launcher")
+                    openSafe(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                } else {
+                    showSettings()
+                }
             },
             Entry(0, "Bersihkan cache", cacheSizeText()) { clearCache() },
             Entry(0, "Ganti wallpaper") {
@@ -1251,6 +1426,312 @@ class MainActivity : Activity() {
             },
             Entry(0, "Launcher default", if (isDefaultHome()) "Aktif" else "Belum diatur") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) }
         ))
+    }
+
+    // ---------- Nama kustom ----------
+
+    private fun names(): MutableMap<String, String> {
+        nameCache?.let { return it }
+        val m = HashMap<String, String>()
+        try {
+            val j = org.json.JSONObject(prefs.getString("names", "{}") ?: "{}")
+            val keysIt = j.keys()
+            while (keysIt.hasNext()) {
+                val k = keysIt.next()
+                m[k] = j.getString(k)
+            }
+        } catch (e: Exception) { /* abaikan */ }
+        nameCache = m
+        return m
+    }
+
+    private fun saveNames() {
+        val j = org.json.JSONObject()
+        for ((k, v) in names()) j.put(k, v)
+        prefs.edit().putString("names", j.toString()).apply()
+    }
+
+    private fun nm(app: App): String = names()[app.pkg] ?: app.label
+
+    private fun showRename(app: App) {
+        val dlg = Dialog(this)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val renamed = names().containsKey(app.pkg)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = sheetBg(false)
+            setPadding(dp(20), dp(20), dp(20), dp(12))
+        }
+        card.addView(TextView(this).apply {
+            text = "Ubah nama"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        card.addView(TextView(this).apply {
+            text = "Nama asli: " + app.label
+            textSize = 13f
+            setTextColor(Color.argb(150, 255, 255, 255))
+            setPadding(0, dp(4), 0, dp(14))
+        })
+        val input = EditText(this).apply {
+            setText(nm(app))
+            setSelection(text.length)
+            setSingleLine()
+            textSize = 17f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.argb(110, 255, 255, 255))
+            hint = "Nama panggilan"
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#2C2C2E"))
+                cornerRadius = dp(16).toFloat()
+            }
+        }
+        card.addView(input, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        fun save() {
+            val v = input.text.toString().trim()
+            if (v.isEmpty() || v == app.label) names().remove(app.pkg) else names()[app.pkg] = v
+            saveNames()
+            lastSig = null
+            renderCurrent()
+            dlg.dismiss()
+        }
+
+        fun btn(label: String, color: Int, onClick: () -> Unit): TextView = TextView(this).apply {
+            text = label
+            textSize = 15f
+            setTextColor(color)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = pressBg()
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+        }
+        if (renamed) {
+            row.addView(btn("Reset", Color.parseColor("#FF6B6B")) {
+                names().remove(app.pkg)
+                saveNames()
+                lastSig = null
+                renderCurrent()
+                dlg.dismiss()
+                toast("Nama dikembalikan ke asli")
+            })
+        }
+        row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        row.addView(btn("Batal", Color.argb(190, 255, 255, 255)) { dlg.dismiss() })
+        row.addView(btn("Simpan", accentNow) { save() })
+        card.addView(row)
+
+        input.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                save()
+                true
+            } else {
+                false
+            }
+        }
+
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            addView(card, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        dlg.setContentView(wrap)
+        dlg.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setGravity(Gravity.CENTER)
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            setDimAmount(0.6f)
+            setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            )
+        }
+        dlg.show()
+        input.requestFocus()
+    }
+
+    // ---------- Pencarian cepat (geser ke atas) ----------
+
+    private fun imm() = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+
+    private fun norm(x: String): String =
+        java.text.Normalizer.normalize(x, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "").lowercase()
+
+    private fun openSearch() {
+        if (viewMode == 3) return
+        viewMode = 3
+        showHeader(false)
+        showBigLetter(null)
+        searchPill.visibility = View.VISIBLE
+        (scroll.layoutParams as FrameLayout.LayoutParams).topMargin = dp(130)
+        scroll.requestLayout()
+        searchBox.setText("")
+        renderSearch()
+        searchBox.requestFocus()
+        searchBox.post { imm().showSoftInput(searchBox, InputMethodManager.SHOW_IMPLICIT) }
+    }
+
+    private fun leaveSearchUi() {
+        if (searchPill.visibility != View.VISIBLE) return
+        imm().hideSoftInputFromWindow(searchBox.windowToken, 0)
+        searchBox.clearFocus()
+        searchBox.setText("")
+        searchPill.visibility = View.GONE
+        (scroll.layoutParams as FrameLayout.LayoutParams).topMargin = dp(215)
+        scroll.requestLayout()
+    }
+
+    private fun renderSearch() {
+        val q = norm(searchBox.text.toString().trim())
+        val all = visibleApps()
+        val res = if (q.isEmpty()) {
+            all.sortedWith { x, y -> collator.compare(nm(x), nm(y)) }
+        } else {
+            all.filter { norm(nm(it)).contains(q) || norm(it.label).contains(q) }
+                .sortedWith { x, y ->
+                    val sx = if (norm(nm(x)).startsWith(q)) 0 else 1
+                    val sy = if (norm(nm(y)).startsWith(q)) 0 else 1
+                    if (sx != sy) sx - sy else collator.compare(nm(x), nm(y))
+                }
+        }
+        searchResults = res
+        lastSig = null
+        list.gravity = Gravity.TOP
+        list.removeAllViews()
+        scroll.scrollTo(0, 0)
+        if (res.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "Tidak ditemukan"
+                textSize = 14f
+                setTextColor(Color.GRAY)
+            })
+        }
+        val mode = iconStyle
+        res.forEach { app -> list.addView(row(app, mode, 18f)) }
+    }
+
+    // ---------- Ketuk 2x untuk kunci layar ----------
+
+    private fun onEmptyTap() {
+        val now = SystemClock.uptimeMillis()
+        if (dtap && viewMode == 0 && now - lastTapAt < 350L) {
+            lastTapAt = 0L
+            lockScreen()
+            return
+        }
+        lastTapAt = now
+        showFavorites()
+    }
+
+    private fun lockServiceEnabled(): Boolean {
+        val enabled = Settings.Secure.getString(
+            contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        val cn = ComponentName(this, LockService::class.java)
+        return enabled.split(":").any {
+            it.equals(cn.flattenToString(), true) || it.equals(cn.flattenToShortString(), true)
+        }
+    }
+
+    private fun lockScreen() {
+        val svc = LockService.instance
+        if (svc == null) {
+            toast("Aktifkan layanan aksesibilitas Mini Launcher")
+            return
+        }
+        if (!svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN)) {
+            toast("Tidak bisa mengunci layar")
+        }
+    }
+
+    // ---------- Sedang diputar ----------
+
+    private fun notifAccess(): Boolean {
+        val s = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return s.contains(packageName)
+    }
+
+    private val mediaCb = object : MediaController.Callback() {
+        override fun onPlaybackStateChanged(state: PlaybackState?) { refreshNowPlaying() }
+        override fun onMetadataChanged(metadata: MediaMetadata?) { refreshNowPlaying() }
+        override fun onSessionDestroyed() { refreshNowPlaying() }
+    }
+
+    private val sessionsListener =
+        MediaSessionManager.OnActiveSessionsChangedListener { list ->
+            bindControllers(list ?: emptyList())
+        }
+
+    private fun startNowPlaying() {
+        if (!nowPlayingOn || !notifAccess()) {
+            stopNowPlaying()
+            return
+        }
+        try {
+            val m = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val cn = ComponentName(this, MediaListenerService::class.java)
+            if (sessionMgr == null) {
+                m.addOnActiveSessionsChangedListener(sessionsListener, cn)
+                sessionMgr = m
+            }
+            bindControllers(m.getActiveSessions(cn))
+        } catch (e: Exception) {
+            stopNowPlaying()
+        }
+    }
+
+    private fun bindControllers(list: List<MediaController>) {
+        for (c in controllers) {
+            try { c.unregisterCallback(mediaCb) } catch (e: Exception) { /* abaikan */ }
+        }
+        controllers = list
+        for (c in list) {
+            try { c.registerCallback(mediaCb) } catch (e: Exception) { /* abaikan */ }
+        }
+        refreshNowPlaying()
+    }
+
+    private fun stopNowPlaying() {
+        try { sessionMgr?.removeOnActiveSessionsChangedListener(sessionsListener) } catch (e: Exception) { /* abaikan */ }
+        sessionMgr = null
+        for (c in controllers) {
+            try { c.unregisterCallback(mediaCb) } catch (e: Exception) { /* abaikan */ }
+        }
+        controllers = emptyList()
+        nowController = null
+        nowPlaying.visibility = View.GONE
+    }
+
+    // Satu baris teks; hilang sepenuhnya saat tidak ada yang diputar
+    private fun refreshNowPlaying() {
+        val c = controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+        nowController = c
+        val md = c?.metadata
+        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE)
+        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+        if (c == null || title.isNullOrBlank()) {
+            nowPlaying.visibility = View.GONE
+            return
+        }
+        nowPlaying.text = if (artist.isNullOrBlank()) title else "$title · $artist"
+        if (nowPlaying.visibility != View.VISIBLE) {
+            nowPlaying.alpha = 0f
+            nowPlaying.visibility = View.VISIBLE
+            nowPlaying.animate().alpha(1f).setDuration(200).start()
+        }
     }
 
     // ---------- Cache ----------
@@ -1273,6 +1754,7 @@ class MainActivity : Activity() {
         val before = cacheBytes()
         iconCache.evictAll()
         noMono.clear()
+        tintable.clear()
         try {
             cacheDir.listFiles()?.forEach { it.deleteRecursively() }
             externalCacheDir?.listFiles()?.forEach { it.deleteRecursively() }
@@ -1309,15 +1791,17 @@ class MainActivity : Activity() {
         when (viewMode) {
             1 -> showLetter(viewLetter)
             2 -> showHidden()
+            3 -> renderSearch()
             else -> showFavorites()
         }
     }
 
     private fun showFavorites() {
         viewMode = 0
+        leaveSearchUi()
         showHeader(true)
         showBigLetter(null)
-        val sig = "f|" + favs.joinToString(",") + "|" + hidden.size + "|" + iconStyle + "|" + apps.size
+        val sig = "f|" + favs.joinToString(",") + "|" + hidden.size + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.BOTTOM
@@ -1343,16 +1827,18 @@ class MainActivity : Activity() {
         val wasLetter = viewMode == 1
         viewMode = 1
         viewLetter = c
+        leaveSearchUi()
         showHeader(false)
         showBigLetter(c)
-        val sig = "l|$c|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size
+        val sig = "l|$c|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL
         list.removeAllViews()
         scroll.scrollTo(0, 0)
         val mode = iconStyle
-        val matches = visibleApps().filter { keyOf(it.label) == c }
+        val matches = visibleApps().filter { keyOf(nm(it)) == c }
+            .sortedWith { x, y -> collator.compare(nm(x), nm(y)) }
         if (matches.isEmpty()) {
             list.addView(TextView(this).apply {
                 text = "Tidak ada aplikasi"
@@ -1366,9 +1852,10 @@ class MainActivity : Activity() {
 
     private fun showHidden() {
         viewMode = 2
+        leaveSearchUi()
         showHeader(false)
         showBigLetter(null)
-        val sig = "h|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size
+        val sig = "h|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="lock_service_desc">Hanya dipakai untuk mengunci layar saat kamu mengetuk dua kali area kosong di layar utama. Tidak membaca isi layar.</string>
+</resources>

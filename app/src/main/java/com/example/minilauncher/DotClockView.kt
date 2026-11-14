@@ -21,6 +21,12 @@ class DotClockView(context: Context) : View(context) {
             invalidate()
         }
 
+    var offColor: Int = Color.argb(28, 255, 255, 255)
+        set(v) {
+            field = v
+            invalidate()
+        }
+
     private val digits = arrayOf(
         arrayOf("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
         arrayOf("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
@@ -68,7 +74,7 @@ class DotClockView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         on.color = dotColor
-        off.color = Color.argb(28, 255, 255, 255)
+        off.color = offColor
         val cal = Calendar.getInstance()
         val is24 = DateFormat.is24HourFormat(context)
         var h = if (is24) cal.get(Calendar.HOUR_OF_DAY) else cal.get(Calendar.HOUR)

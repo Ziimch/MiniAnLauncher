@@ -75,7 +75,9 @@ class MainActivity : Activity() {
     private lateinit var scrim: View
     private lateinit var clockMin: TextClock
     private lateinit var dotClock: DotClockView
-    private lateinit var nowPlaying: TextView
+    private lateinit var nowPlaying: LinearLayout
+    private lateinit var nowText: TextView
+    private lateinit var nowEq: PixelEqView
     private lateinit var searchPill: LinearLayout
     private lateinit var searchBox: EditText
     private lateinit var clockTime: TextClock
@@ -94,6 +96,9 @@ class MainActivity : Activity() {
     @Volatile private var loading = false
     private val iconExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var accentNow = Color.WHITE
+    private var letterBase = Color.WHITE
+    private val searchPillBg = GradientDrawable()
+    private val pillBg = GradientDrawable()
     private var lowBattery = false
     private var navBottom = 0
     private var lastTapAt = 0L
@@ -139,14 +144,57 @@ class MainActivity : Activity() {
     private val bgNames = listOf("Hitam polos", "Wallpaper redup", "Wallpaper jernih")
     private val iconNames = listOf("Tanpa ikon", "Ikon warna", "Monokrom")
 
-    private val accentNames = listOf("Putih", "Biru", "Mint", "Oranye", "Pink", "Ungu")
-    private val accentColors = intArrayOf(
+    private val accentNamesClassic = listOf("Putih", "Biru", "Mint", "Oranye", "Pink", "Ungu")
+    private val accentNamesCozy = listOf("Amber", "Terakota", "Sage", "Krem", "Mawar", "Biru debu")
+    private val themeNames = listOf("Klasik hitam", "Retro cozy")
+    private val accentColorsClassic = intArrayOf(
         0xFFFFFFFF.toInt(), 0xFF8AB4FF.toInt(), 0xFF7EE0B5.toInt(),
         0xFFFFB070.toInt(), 0xFFFF8FB8.toInt(), 0xFFB79CFF.toInt()
     )
+    private val accentColorsCozy = intArrayOf(
+        0xFFFFB45A.toInt(), 0xFFE8825F.toInt(), 0xFFA8C69F.toInt(),
+        0xFFF3E7D3.toInt(), 0xFFE59BA6.toInt(), 0xFF8FB3C9.toInt()
+    )
+
+    private fun accentNames() = if (cozy) accentNamesCozy else accentNamesClassic
+    private fun accentColors() = if (cozy) accentColorsCozy else accentColorsClassic
+
+    // ---------- Tema: Klasik hitam / Retro cozy (krem hangat, amber, font mono) ----------
+    private var themeIdx: Int
+        get() = prefs.getInt("theme", 0).coerceIn(0, 1)
+        set(v) { prefs.edit().putInt("theme", v).apply() }
+
+    private val cozy: Boolean get() = themeIdx == 1
+
+    private fun cText(alpha: Int = 255): Int =
+        if (cozy) Color.argb(alpha, 243, 231, 211) else Color.argb(alpha, 255, 255, 255)
+
+    private fun cSheet(alpha: Int): Int =
+        if (cozy) Color.argb(alpha, 38, 29, 22) else Color.argb(alpha, 28, 28, 30)
+
+    private fun cSurface(): Int = Color.parseColor(if (cozy) "#3A2D22" else "#2C2C2E")
+
+    private fun cStroke(): Int =
+        if (cozy) Color.argb(48, 243, 200, 140) else Color.argb(26, 255, 255, 255)
+
+    private fun cDanger(): Int = Color.parseColor(if (cozy) "#E8745A" else "#FF6B6B")
+
+    private fun cBg(): Int = if (cozy) Color.parseColor("#110D09") else Color.BLACK
+
+    private fun fontBody(): Typeface =
+        if (cozy) Typeface.create("monospace", Typeface.NORMAL)
+        else Typeface.create("sans-serif-medium", Typeface.NORMAL)
+
+    private fun applyTheme() {
+        applyClockStyle()
+        applyBackground()
+        applyAccent()
+        lastSig = null
+        renderCurrent()
+    }
 
     private var accentIdx: Int
-        get() = prefs.getInt("accent", 0).coerceIn(0, accentColors.size - 1)
+        get() = prefs.getInt("accent", 0).coerceIn(0, 5)
         set(v) { prefs.edit().putInt("accent", v).apply() }
 
     private var clockStyle: Int
@@ -275,21 +323,35 @@ class MainActivity : Activity() {
             setOnLongClickListener { showSettings(); true }
         }
         header.addView(batteryRow)
-        nowPlaying = TextView(this).apply {
+        nowEq = PixelEqView(this)
+        nowText = TextView(this).apply {
             textSize = 12f
             letterSpacing = 0.04f
-            maxLines = 1
-            maxWidth = dp(260)
-            ellipsize = TextUtils.TruncateAt.END
-            setTextColor(Color.argb(190, 255, 255, 255))
-            setPadding(dp(4), dp(2), 0, 0)
+            setSingleLine()
+            ellipsize = TextUtils.TruncateAt.MARQUEE
+            marqueeRepeatLimit = -1
+            isSelected = true
+            isHorizontalFadingEdgeEnabled = true
+            setFadingEdgeLength(dp(10))
+            setTextColor(Color.argb(200, 255, 255, 255))
+        }
+        nowPlaying = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(10), 0, 0)
             visibility = View.GONE
+            addView(nowEq, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(10) })
+            addView(nowText, LinearLayout.LayoutParams(
+                dp(210), ViewGroup.LayoutParams.WRAP_CONTENT))
             setOnClickListener {
                 try { nowController?.sessionActivity?.send() } catch (e: Exception) { /* abaikan */ }
             }
             setOnLongClickListener { showSettings(); true }
         }
-        header.addView(nowPlaying)
+        header.addView(nowPlaying, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         header.getChildAt(1).setOnClickListener { openClock() }
         header.getChildAt(1).setOnLongClickListener { showSettings(); true }
         header.getChildAt(2).setOnClickListener { openCalendar() }
@@ -401,11 +463,7 @@ class MainActivity : Activity() {
         }
         searchPill = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#1C1C1E"))
-                cornerRadius = dp(26).toFloat()
-                setStroke(dp(1), Color.argb(26, 255, 255, 255))
-            }
+            background = searchPillBg
             setPadding(dp(20), 0, dp(20), 0)
             visibility = View.GONE
             addView(searchBox, LinearLayout.LayoutParams(
@@ -434,10 +492,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             setPadding(dp(18), dp(10), dp(18), dp(10))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#2C2C2E"))
-                cornerRadius = dp(22).toFloat()
-            }
+            background = pillBg
             alpha = 0f
         }
         root.addView(pill, FrameLayout.LayoutParams(
@@ -533,8 +588,8 @@ class MainActivity : Activity() {
                 clockMin.format12Hour = "mm"
                 clockTime.textSize = 66f
                 clockMin.textSize = 66f
-                clockTime.typeface = Typeface.create("sans-serif", Typeface.BOLD)
-                clockMin.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+                clockTime.typeface = Typeface.create(if (cozy) "monospace" else "sans-serif", Typeface.BOLD)
+                clockMin.typeface = Typeface.create(if (cozy) "monospace" else "sans-serif-light", Typeface.NORMAL)
             }
             3 -> {
                 clockTime.format24Hour = "HH.mm"
@@ -545,8 +600,8 @@ class MainActivity : Activity() {
             else -> {
                 clockTime.format24Hour = "HH:mm"
                 clockTime.format12Hour = "hh:mm"
-                clockTime.textSize = 72f
-                clockTime.typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                clockTime.textSize = if (cozy) 62f else 72f
+                clockTime.typeface = Typeface.create(if (cozy) "monospace" else "sans-serif-thin", Typeface.NORMAL)
             }
         }
         if (st == 3) {
@@ -562,7 +617,7 @@ class MainActivity : Activity() {
             clockDate.textSize = 13f
             clockDate.letterSpacing = 0.16f
             clockDate.setAllCaps(true)
-            clockDate.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            clockDate.typeface = fontBody()
         }
         clockDate.setPadding(dp(4), dp(4), 0, 0)
     }
@@ -575,20 +630,47 @@ class MainActivity : Activity() {
     }
 
     private fun applyAccent() {
-        accentNow = accentColors[accentIdx]
+        accentNow = accentColors()[accentIdx]
         val a = accentNow
         val r = Color.red(a)
         val g = Color.green(a)
         val b = Color.blue(a)
-        clockTime.setTextColor(a)
-        clockMin.setTextColor(Color.argb(120, r, g, b))
+        val mono: Typeface? = if (cozy) Typeface.create("monospace", Typeface.NORMAL) else null
+        val dotOff = if (cozy) Color.argb(42, 255, 176, 90) else Color.argb(28, 255, 255, 255)
+        letterBase = cText()
+
+        clockTime.setTextColor(if (cozy) cText() else a)
+        clockMin.setTextColor(if (cozy) cText(120) else Color.argb(120, r, g, b))
+        clockDate.setTextColor(if (cozy) a else Color.argb(215, r, g, b))
         dotClock.dotColor = a
-        nowPlaying.setTextColor(Color.argb(190, r, g, b))
-        clockDate.setTextColor(Color.argb(215, r, g, b))
+        dotClock.offColor = dotOff
+        nowEq.pixelColor = a
+        nowEq.offColor = dotOff
+        nowText.setTextColor(Color.argb(200, r, g, b))
+        nowText.typeface = mono ?: Typeface.DEFAULT
         bigLetter.setTextColor(Color.argb(80, r, g, b))
-        batteryFillBg.setColor(if (lowBattery) Color.parseColor("#FF6B6B") else a)
+        bigLetter.typeface = mono ?: Typeface.create("sans-serif-thin", Typeface.NORMAL)
+        greeting.setTextColor(cText(130))
+        greeting.typeface = mono ?: Typeface.DEFAULT
+        batteryText.setTextColor(cText(170))
+        batteryText.typeface = mono ?: Typeface.DEFAULT
+        batteryFillBg.setColor(if (lowBattery) cDanger() else a)
+
+        searchBox.setTextColor(cText())
+        searchBox.setHintTextColor(cText(120))
+        searchBox.typeface = mono ?: Typeface.DEFAULT
+        searchPillBg.setColor(cSheet(255))
+        searchPillBg.cornerRadius = dp(26).toFloat()
+        searchPillBg.setStroke(dp(1), cStroke())
+        pillBg.setColor(cSurface())
+        pillBg.cornerRadius = dp(22).toFloat()
+        pill.setTextColor(cText())
+
         for (i in 0 until strip.childCount) {
-            (strip.getChildAt(i) as? TextView)?.setTextColor(Color.WHITE)
+            (strip.getChildAt(i) as? TextView)?.let {
+                it.setTextColor(letterBase)
+                it.typeface = mono ?: Typeface.DEFAULT
+            }
         }
     }
 
@@ -617,7 +699,7 @@ class MainActivity : Activity() {
     private fun applyBackground() {
         if (bgMode == 0) {
             window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
-            window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+            window.setBackgroundDrawable(ColorDrawable(cBg()))
             root.setBackgroundColor(Color.TRANSPARENT)
             scrim.visibility = View.GONE
         } else {
@@ -698,7 +780,7 @@ class MainActivity : Activity() {
         lp.width = if (pct <= 0) 0 else maxOf(dp(2), dp(44) * pct / 100)
         batteryFill.layoutParams = lp
         lowBattery = pct <= 15 && !charging
-        batteryFillBg.setColor(if (lowBattery) Color.parseColor("#FF6B6B") else accentNow)
+        batteryFillBg.setColor(if (lowBattery) cDanger() else accentNow)
     }
 
     private fun updateGreeting() {
@@ -813,7 +895,7 @@ class MainActivity : Activity() {
                 c.scaleX = sc
                 c.scaleY = sc
                 c.alpha = base + (1f - base) * w
-                if (c is TextView) c.setTextColor(blend(Color.WHITE, accentNow, w))
+                if (c is TextView) c.setTextColor(blend(letterBase, accentNow, w))
             }
             if (moving || touching) strip.postOnAnimation(this) else frameRunning = false
         }
@@ -1042,14 +1124,14 @@ class MainActivity : Activity() {
         val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
         val c = Canvas(b)
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
-        p.color = Color.WHITE
+        p.color = cText()
         p.style = Paint.Style.STROKE
         p.strokeWidth = 4f
         c.drawCircle(s / 2f, s / 2f, s / 2f - 4f, p)
         p.style = Paint.Style.FILL
         p.textSize = 32f
         p.textAlign = Paint.Align.CENTER
-        p.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        p.typeface = fontBody()
         val ch = label.firstOrNull()?.uppercaseChar()?.toString() ?: "?"
         c.drawText(ch, s / 2f, s / 2f + 11f, p)
         return b
@@ -1106,11 +1188,11 @@ class MainActivity : Activity() {
         }
         r.addView(TextView(this).apply {
             text = nm(app)
-            textSize = textSp
-            setTextColor(Color.WHITE)
+            textSize = if (cozy) textSp - 2f else textSp
+            setTextColor(cText())
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            typeface = fontBody()
         })
         r.setOnClickListener { launch(app, r) }
         r.setOnLongClickListener { showMenu(app); true }
@@ -1144,14 +1226,14 @@ class MainActivity : Activity() {
 
     // Latar lembar: transparan (kaca) jika blur didukung, gelap pekat jika tidak; garis tepi 1dp putih 10%
     private fun sheetBg(blur: Boolean) = GradientDrawable().apply {
-        setColor(if (blur) Color.argb(170, 28, 28, 30) else Color.argb(245, 28, 28, 30))
+        setColor(if (blur) cSheet(170) else cSheet(245))
         cornerRadius = dp(28).toFloat()
-        setStroke(dp(1), Color.argb(26, 255, 255, 255))
+        setStroke(dp(1), cStroke())
     }
 
     private fun pressBg(): Drawable = StateListDrawable().apply {
         addState(intArrayOf(android.R.attr.state_pressed), GradientDrawable().apply {
-            setColor(Color.parseColor("#2C2C2E"))
+            setColor(cSurface())
             cornerRadius = dp(18).toFloat()
         })
         addState(intArrayOf(), ColorDrawable(Color.TRANSPARENT))
@@ -1181,19 +1263,19 @@ class MainActivity : Activity() {
         head.addView(TextView(this).apply {
             text = title
             textSize = 18f
-            setTextColor(Color.WHITE)
+            setTextColor(cText())
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            typeface = fontBody()
         })
         card.addView(head)
-        card.addView(View(this).apply { setBackgroundColor(Color.parseColor("#2C2C2E")) },
+        card.addView(View(this).apply { setBackgroundColor(cSurface()) },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
                 setMargins(dp(8), 0, dp(8), dp(6))
             })
 
         entries.forEach { e ->
-            val color = if (e.danger) Color.parseColor("#FF6B6B") else Color.WHITE
+            val color = if (e.danger) cDanger() else cText()
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1209,7 +1291,7 @@ class MainActivity : Activity() {
                 val iv = ImageView(this)
                 if (e.icon > 0) {
                     iv.setImageResource(e.icon)
-                    iv.setColorFilter(if (e.danger) color else Color.argb(230, 255, 255, 255))
+                    iv.setColorFilter(if (e.danger) color else cText(230))
                 }
                 row.addView(iv, LinearLayout.LayoutParams(dp(22), dp(22)).apply { marginEnd = dp(18) })
             }
@@ -1217,12 +1299,13 @@ class MainActivity : Activity() {
                 text = e.label
                 textSize = 16f
                 setTextColor(color)
+                if (cozy) typeface = fontBody()
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             if (e.value != null) {
                 row.addView(TextView(this).apply {
                     text = e.value
                     textSize = 14f
-                    setTextColor(Color.argb(150, 255, 255, 255))
+                    setTextColor(cText(150))
                 })
             }
             card.addView(row, LinearLayout.LayoutParams(
@@ -1354,6 +1437,12 @@ class MainActivity : Activity() {
     private fun showSettings() {
         fun onOff(b: Boolean) = if (b) "Aktif" else "Mati"
         showSheet("Pengaturan", null, listOf(
+            Entry(0, "Tema", themeNames[themeIdx]) {
+                pickOption("Tema", themeNames, themeIdx) {
+                    themeIdx = it
+                    applyTheme()
+                }
+            },
             Entry(0, "Gaya jam", clockNames[clockStyle]) {
                 pickOption("Gaya jam", clockNames, clockStyle) {
                     clockStyle = it
@@ -1367,8 +1456,8 @@ class MainActivity : Activity() {
                     applyBackground()
                 }
             },
-            Entry(0, "Warna aksen", accentNames[accentIdx]) {
-                pickOption("Warna aksen", accentNames, accentIdx) {
+            Entry(0, "Warna aksen", accentNames()[accentIdx]) {
+                pickOption("Warna aksen", accentNames(), accentIdx) {
                     accentIdx = it
                     applyAccent()
                     lastSig = null
@@ -1465,13 +1554,13 @@ class MainActivity : Activity() {
         card.addView(TextView(this).apply {
             text = "Ubah nama"
             textSize = 18f
-            setTextColor(Color.WHITE)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(cText())
+            typeface = fontBody()
         })
         card.addView(TextView(this).apply {
             text = "Nama asli: " + app.label
             textSize = 13f
-            setTextColor(Color.argb(150, 255, 255, 255))
+            setTextColor(cText(150))
             setPadding(0, dp(4), 0, dp(14))
         })
         val input = EditText(this).apply {
@@ -1479,13 +1568,13 @@ class MainActivity : Activity() {
             setSelection(text.length)
             setSingleLine()
             textSize = 17f
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.argb(110, 255, 255, 255))
+            setTextColor(cText())
+            setHintTextColor(cText(110))
             hint = "Nama panggilan"
             imeOptions = EditorInfo.IME_ACTION_DONE
             setPadding(dp(16), dp(12), dp(16), dp(12))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#2C2C2E"))
+                setColor(cSurface())
                 cornerRadius = dp(16).toFloat()
             }
         }
@@ -1505,7 +1594,7 @@ class MainActivity : Activity() {
             text = label
             textSize = 15f
             setTextColor(color)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            typeface = fontBody()
             setPadding(dp(16), dp(10), dp(16), dp(10))
             background = pressBg()
             isClickable = true
@@ -1518,7 +1607,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(12), 0, 0)
         }
         if (renamed) {
-            row.addView(btn("Reset", Color.parseColor("#FF6B6B")) {
+            row.addView(btn("Reset", cDanger()) {
                 names().remove(app.pkg)
                 saveNames()
                 lastSig = null
@@ -1528,7 +1617,7 @@ class MainActivity : Activity() {
             })
         }
         row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        row.addView(btn("Batal", Color.argb(190, 255, 255, 255)) { dlg.dismiss() })
+        row.addView(btn("Batal", cText(190)) { dlg.dismiss() })
         row.addView(btn("Simpan", accentNow) { save() })
         card.addView(row)
 
@@ -1715,18 +1804,39 @@ class MainActivity : Activity() {
         nowPlaying.visibility = View.GONE
     }
 
-    // Satu baris teks; hilang sepenuhnya saat tidak ada yang diputar
+    private val junkRegex = Regex(
+        "https?://\\S+|\\b[\\w-]+\\.(?:com|net|org|io|fm|tv|co)(?:/\\S*)?",
+        RegexOption.IGNORE_CASE
+    )
+
+    // Buang sampah metadata seperti " | soundcloud.com/..." atau tautan di akhir judul
+    private fun stripJunk(x: String): String {
+        val t = junkRegex.replace(x.substringBefore(" | "), "")
+        return t.replace(Regex("\\s{2,}"), " ").trim().trimEnd('-', '|', '·', ' ')
+    }
+
+    // Satu baris dengan equalizer pixel; hilang sepenuhnya saat tidak ada yang diputar
     private fun refreshNowPlaying() {
         val c = controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
         nowController = c
         val md = c?.metadata
-        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE)
-        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
-        if (c == null || title.isNullOrBlank()) {
+        val rawTitle = md?.getString(MediaMetadata.METADATA_KEY_TITLE)
+        val rawArtist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+        if (c == null || rawTitle.isNullOrBlank()) {
+            nowEq.playing = false
             nowPlaying.visibility = View.GONE
             return
         }
-        nowPlaying.text = if (artist.isNullOrBlank()) title else "$title · $artist"
+        var title = stripJunk(rawTitle)
+        if (title.isBlank()) title = rawTitle.trim()
+        val artist = if (rawArtist.isNullOrBlank()) "" else stripJunk(rawArtist)
+        val line = when {
+            artist.isBlank() -> title
+            title.contains(artist, true) -> title // judul sudah memuat nama artis
+            else -> "$title · $artist"
+        }
+        if (nowText.text.toString() != line) nowText.text = line
+        nowEq.playing = true
         if (nowPlaying.visibility != View.VISIBLE) {
             nowPlaying.alpha = 0f
             nowPlaying.visibility = View.VISIBLE
@@ -1801,7 +1911,7 @@ class MainActivity : Activity() {
         leaveSearchUi()
         showHeader(true)
         showBigLetter(null)
-        val sig = "f|" + favs.joinToString(",") + "|" + hidden.size + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
+        val sig = "f|" + favs.joinToString(",") + "|" + hidden.size + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode() + "|" + themeIdx
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.BOTTOM
@@ -1830,7 +1940,7 @@ class MainActivity : Activity() {
         leaveSearchUi()
         showHeader(false)
         showBigLetter(c)
-        val sig = "l|$c|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
+        val sig = "l|$c|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode() + "|" + themeIdx
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL
@@ -1855,7 +1965,7 @@ class MainActivity : Activity() {
         leaveSearchUi()
         showHeader(false)
         showBigLetter(null)
-        val sig = "h|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode()
+        val sig = "h|" + hidden.joinToString(",") + "|" + iconStyle + "|" + apps.size + "|" + names().hashCode() + "|" + themeIdx
         if (sig == lastSig && list.childCount > 0) return
         lastSig = sig
         list.gravity = Gravity.CENTER_VERTICAL

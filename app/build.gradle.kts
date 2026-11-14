@@ -8,7 +8,7 @@ android {
     compileSdk = 34
     defaultConfig {
         applicationId = "com.example.minilauncher"
-        minSdk = 28
+        minSdk = 26
         targetSdk = 34
         // Diisi otomatis oleh GitHub Actions; harus selalu naik agar bisa di-update
         versionCode = System.getenv("VERSION_CODE")?.toIntOrNull() ?: 1

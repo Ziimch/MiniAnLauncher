@@ -64,6 +64,17 @@ import android.widget.EditText
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
+import android.app.ActivityManager
+import android.app.AlarmManager
+import android.app.SearchManager
+import android.content.res.Configuration
+import android.text.format.DateFormat
+import android.os.Environment
+import android.os.storage.StorageManager
+import android.system.OsConstants
+import android.app.role.RoleManager
 import kotlin.math.abs
 import kotlin.math.exp
 
@@ -84,7 +95,8 @@ class MainActivity : Activity() {
     private lateinit var searchPill: LinearLayout
     private lateinit var searchBox: EditText
     private lateinit var clockTime: TextClock
-    private lateinit var clockDate: TextClock
+    private lateinit var clockDate: CapsTextClock
+    private lateinit var alarmText: TextView
     private lateinit var pill: TextView
     private lateinit var bigLetter: TextView
     private var bigShown: Char? = null
@@ -104,6 +116,13 @@ class MainActivity : Activity() {
     private val pillBg = GradientDrawable()
     private var lowBattery = false
     private var navBottom = 0
+    private var stoppedAt = 0L
+    private var pulse: ObjectAnimator? = null
+    private var greetingBase = ""
+    private var cursorActive = false
+    private var cursorOn = false
+    private var lastFont = 0f
+    private var lastDpi = 0
     private var lastTapAt = 0L
     private var searchResults: List<App> = emptyList()
     private var nameCache: MutableMap<String, String>? = null
@@ -116,7 +135,15 @@ class MainActivity : Activity() {
     private var viewMode = 0
     private var viewLetter = 'A'
 
-    private val prefs by lazy { getSharedPreferences("fav", MODE_PRIVATE) }
+    // Disimpan di penyimpanan "device protected" agar launcher tetap bisa berjalan sebelum layar
+    // pertama kali dibuka setelah restart (Direct Boot). Data lama dipindahkan otomatis.
+    private val prefs by lazy {
+        val dp = createDeviceProtectedStorageContext()
+        try {
+            dp.moveSharedPreferencesFrom(this, "fav")
+        } catch (e: Exception) { /* penyimpanan biasa belum terbuka */ }
+        dp.getSharedPreferences("fav", MODE_PRIVATE)
+    }
 
     private val KEY_FAV = "fav"
     private val KEY_HIDDEN = "hidden"
@@ -192,6 +219,7 @@ class MainActivity : Activity() {
         applyClockStyle()
         applyBackground()
         applyAccent()
+        applyMotion()
         lastSig = null
         renderCurrent()
     }
@@ -207,6 +235,10 @@ class MainActivity : Activity() {
     private var bgMode: Int
         get() = prefs.getInt("bg", 0).coerceIn(0, 2)
         set(v) { prefs.edit().putInt("bg", v).apply() }
+
+    private var animPref: Boolean
+        get() = prefs.getBoolean("anim", true)
+        set(v) { prefs.edit().putBoolean("anim", v).apply() }
 
     private var nowPlayingOn: Boolean
         get() = prefs.getBoolean("nowplay", false)
@@ -236,12 +268,14 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lastFont = resources.configuration.fontScale
+        lastDpi = resources.configuration.densityDpi
         root = FrameLayout(this)
         root.clipChildren = false
         root.setOnClickListener { onEmptyTap() }
         root.setOnLongClickListener { showSettings(); true }
         root.setOnApplyWindowInsetsListener { v, insets ->
-            val cut = insets.displayCutout?.safeInsetTop ?: 0
+            val cut = if (Build.VERSION.SDK_INT >= 28) (insets.displayCutout?.safeInsetTop ?: 0) else 0
             navBottom = insets.stableInsetBottom
             v.setPadding(0, maxOf(insets.stableInsetTop, cut), 0, insets.stableInsetBottom)
             insets
@@ -266,7 +300,6 @@ class MainActivity : Activity() {
         greeting = TextView(this).apply {
             textSize = 12f
             letterSpacing = 0.2f
-            setAllCaps(true)
             setTextColor(Color.argb(130, 255, 255, 255))
             setPadding(dp(4), 0, 0, dp(2))
         }
@@ -291,7 +324,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8); bottomMargin = dp(6) })
         }
-        clockDate = TextClock(this).apply {
+        clockDate = CapsTextClock(this).apply {
             setTextColor(Color.argb(210, 255, 255, 255))
         }
         header.addView(timeBox)
@@ -313,12 +346,21 @@ class MainActivity : Activity() {
             letterSpacing = 0.08f
             setTextColor(Color.argb(170, 255, 255, 255))
         }
+        alarmText = TextView(this).apply {
+            textSize = 12f
+            letterSpacing = 0.08f
+            setTextColor(Color.argb(140, 255, 255, 255))
+            visibility = View.GONE
+        }
         val batteryRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(4), dp(16), 0, dp(6))
             addView(track, LinearLayout.LayoutParams(dp(44), dp(3)).apply { marginEnd = dp(10) })
             addView(batteryText)
+            addView(alarmText, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12) })
             setOnClickListener {
                 if (viewMode != 0) showFavorites()
                 else openSafe(Intent(Intent.ACTION_POWER_USAGE_SUMMARY), "Tidak bisa membuka pengaturan baterai")
@@ -361,6 +403,8 @@ class MainActivity : Activity() {
         header.getChildAt(2).setOnLongClickListener { showSettings(); true }
         applyClockStyle()
         applyHeaderOptions()
+        pressFx(header.getChildAt(1))
+        pressFx(header.getChildAt(2))
         root.addView(header, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
@@ -449,15 +493,21 @@ class MainActivity : Activity() {
             override fun beforeTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun afterTextChanged(e: Editable?) {
-                if (viewMode == 3) safely { renderSearch() }
+                if (viewMode == 3) {
+                    searchBox.removeCallbacks(searchRun)
+                    searchBox.postDelayed(searchRun, 90L)
+                }
             }
         })
         searchBox.setOnEditorActionListener { _, actionId, event ->
             val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER &&
                 event.action == KeyEvent.ACTION_DOWN
             if (actionId == EditorInfo.IME_ACTION_SEARCH || actionId == EditorInfo.IME_ACTION_DONE || enter) {
+                val typed = searchBox.text.toString().trim()
                 if (searchResults.size == 1) {
                     launch(searchResults[0], list.getChildAt(0) ?: root)
+                } else if (searchResults.isEmpty() && typed.isNotEmpty()) {
+                    webSearch(typed)
                 }
                 true
             } else {
@@ -505,21 +555,25 @@ class MainActivity : Activity() {
             bottomMargin = dp(28)
         })
 
-        registerReceiver(pkgReceiver, IntentFilter().apply {
+        regReceiver(pkgReceiver, IntentFilter().apply {
             addAction(Intent.ACTION_PACKAGE_ADDED)
             addAction(Intent.ACTION_PACKAGE_REMOVED)
             addAction(Intent.ACTION_PACKAGE_REPLACED)
             addDataScheme("package")
         })
+        regReceiver(pkgReceiver, IntentFilter(Intent.ACTION_USER_UNLOCKED))
 
-        val wlp = window.attributes
-        wlp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        window.attributes = wlp
+        if (Build.VERSION.SDK_INT >= 28) {
+            val wlp = window.attributes
+            wlp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = wlp
+        }
 
         setContentView(root)
         applySystemUi()
         applyBackground()
         applyAccent()
+        applyMotion()
     }
 
     // ---------- Gesek ke bawah: panel notifikasi ----------
@@ -570,6 +624,8 @@ class MainActivity : Activity() {
                 } catch (e: Exception) { /* coba cara berikutnya */ }
             }
         }
+        val svc = LockService.instance
+        if (svc != null && svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)) return
         toast("Tidak bisa membuka panel notifikasi")
     }
 
@@ -616,14 +672,14 @@ class MainActivity : Activity() {
             clockDate.format12Hour = "EEE, d MMM"
             clockDate.textSize = 18f
             clockDate.letterSpacing = 0f
-            clockDate.setAllCaps(false)
+            clockDate.caps = false
             clockDate.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
         } else {
             clockDate.format24Hour = "EEEE  ·  d MMMM"
             clockDate.format12Hour = "EEEE  ·  d MMMM"
             clockDate.textSize = 13f
             clockDate.letterSpacing = 0.16f
-            clockDate.setAllCaps(true)
+            clockDate.caps = true
             clockDate.typeface = fontBody()
         }
         clockDate.setPadding(dp(4), dp(4), 0, 0)
@@ -660,6 +716,8 @@ class MainActivity : Activity() {
         greeting.setTextColor(cText(130))
         greeting.typeface = mono ?: Typeface.DEFAULT
         batteryText.setTextColor(cText(170))
+        alarmText.setTextColor(cText(140))
+        alarmText.typeface = mono ?: Typeface.DEFAULT
         batteryText.typeface = mono ?: Typeface.DEFAULT
         batteryFillBg.setColor(if (lowBattery) cDanger() else a)
 
@@ -743,6 +801,10 @@ class MainActivity : Activity() {
     private val pkgReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             appsDirty = true
+            if (i?.action == Intent.ACTION_USER_UNLOCKED) {
+                safely { loadAppsAsync() }
+                return
+            }
             val pkg = i?.data?.schemeSpecificPart
             if (pkg != null) {
                 iconCache.remove("m:$pkg")
@@ -767,13 +829,18 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        val sticky = registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val sticky = regReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         if (sticky != null) updateBattery(sticky)
         safely { startNowPlaying() }
+        safely { updateAlarm() }
+        safely { applyMotion() }
     }
 
     override fun onStop() {
         super.onStop()
+        stoppedAt = SystemClock.uptimeMillis()
+        safely { setPulse(false) }
+        safely { stopCursor() }
         safely { stopNowPlaying() }
         try { unregisterReceiver(batteryReceiver) } catch (e: Exception) { /* abaikan */ }
     }
@@ -791,26 +858,40 @@ class MainActivity : Activity() {
         lp.width = if (pct <= 0) 0 else maxOf(dp(2), dp(44) * pct / 100)
         batteryFill.layoutParams = lp
         lowBattery = pct <= 15 && !charging
+        setPulse(charging && ambientOn())
         batteryFillBg.setColor(if (lowBattery) cDanger() else accentNow)
     }
 
     private fun updateGreeting() {
         val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
-        greeting.text = when {
+        val g = when {
             h < 4 -> "Selamat malam"
             h < 11 -> "Selamat pagi"
             h < 15 -> "Selamat siang"
             h < 18 -> "Selamat sore"
             else -> "Selamat malam"
         }
+        greetingBase = g.uppercase()
+        renderGreeting()
     }
 
     override fun onResume() {
         super.onResume()
+        // baru kembali setelah lama pergi (membuka aplikasi lain) -> beranda "hidup" sebentar
+        val away = stoppedAt != 0L && SystemClock.uptimeMillis() - stoppedAt > 800L
+        stoppedAt = 0L
         safely { updateGreeting() }
+        safely { updateAlarm() }
+        safely { maybeHintDefault() }
         safely { showFavorites() }
         loadAppsAsync()
         safely { precomputeIcons() }
+        if (away && motionOn()) {
+            safely {
+                animateHeaderIn()
+                if (viewMode == 0) animateRows()
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -921,6 +1002,7 @@ class MainActivity : Activity() {
 
     // Baris muncul bergantian: fade + geser dari kanan
     private fun animateRows() {
+        if (!motionOn()) return
         for (i in 0 until minOf(list.childCount, 8)) {
             val v = list.getChildAt(i)
             v.alpha = 0f
@@ -966,8 +1048,11 @@ class MainActivity : Activity() {
 
     // Ikon disimpan sebagai bitmap kecil dalam cache berbatas 6 MB.
     // (Sebelumnya drawable ikon utuh ikut tersimpan -> memori besar.)
-    private val iconCache = object : LruCache<String, Bitmap>(6 * 1024 * 1024) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    private val iconCache: LruCache<String, Bitmap> by lazy {
+        val mb = if (isLowRam()) 2 else 6 // HP RAM kecil: cache lebih kecil
+        object : LruCache<String, Bitmap>(mb * 1024 * 1024) {
+            override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+        }
     }
     private val noMono: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -1210,17 +1295,55 @@ class MainActivity : Activity() {
         pill.animate().alpha(0f).translationY(dp(12).toFloat()).setDuration(200).start()
     }
 
-    private fun toast(msg: String) {
+    private fun toast(msg: String) = showPill(msg, 2000L, null)
+
+    // Pesan kecil di bawah layar; bisa diketuk jika ada aksi
+    private fun showPill(msg: String, ms: Long, action: (() -> Unit)?) {
         pill.removeCallbacks(hidePill)
         pill.animate().cancel()
         pill.text = msg
+        if (action != null) {
+            pill.setOnClickListener {
+                hidePill.run()
+                action()
+            }
+        } else {
+            pill.setOnClickListener(null)
+            pill.isClickable = false
+        }
         pill.translationY = dp(12).toFloat()
         pill.animate()
             .alpha(1f).translationY(0f)
             .setDuration(200)
             .setInterpolator(DecelerateInterpolator())
             .start()
-        pill.postDelayed(hidePill, 2000)
+        pill.postDelayed(hidePill, ms)
+    }
+
+    // Jika Mini Launcher dibuka tapi bukan launcher default (mis. setelah HP restart), tawarkan mengaturnya
+    private fun maybeHintDefault() {
+        if (isDefaultHome()) return
+        val now = System.currentTimeMillis()
+        if (now - prefs.getLong("def_hint", 0L) < 6L * 3600L * 1000L) return
+        prefs.edit().putLong("def_hint", now).apply()
+        showPill("Belum jadi launcher default. Ketuk untuk mengatur", 7000L) { requestDefaultHome() }
+    }
+
+    private val REQ_ROLE = 4712
+
+    // Android 10+: satu dialog sistem "Jadikan launcher default"; versi lama: halaman pengaturan
+    @Suppress("DEPRECATION")
+    private fun requestDefaultHome() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val rm = getSystemService(Context.ROLE_SERVICE) as RoleManager
+                if (rm.isRoleAvailable(RoleManager.ROLE_HOME) && !rm.isRoleHeld(RoleManager.ROLE_HOME)) {
+                    startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_HOME), REQ_ROLE)
+                    return
+                }
+            } catch (e: Exception) { /* pakai halaman pengaturan */ }
+        }
+        openHomeSettings()
     }
 
     private fun openSafe(intent: Intent, err: String = "Tidak bisa membuka pengaturan") {
@@ -1608,9 +1731,15 @@ class MainActivity : Activity() {
                     if (it != 0) precomputeIcons()
                 }
             },
-            Entry(0, "Sapaan & baterai", onOff(showInfo)) {
+            Entry(0, "Info tambahan", onOff(showInfo)) {
                 showInfo = !showInfo
                 applyHeaderOptions()
+                applyMotion()
+                showSettings()
+            },
+            Entry(0, "Animasi", onOff(animPref)) {
+                animPref = !animPref
+                applyMotion()
                 showSettings()
             },
             Entry(0, "Sedang diputar",
@@ -1643,14 +1772,14 @@ class MainActivity : Activity() {
                     showSettings()
                 }
             },
-            Entry(0, "Bersihkan cache", cacheSizeText()) { clearCache() },
+            Entry(0, "Bersihkan cache", cacheSizeText()) { showCacheMenu() },
             Entry(0, "Ganti wallpaper") {
                 openSafe(
                     Intent.createChooser(Intent(Intent.ACTION_SET_WALLPAPER), "Pilih wallpaper"),
                     "Tidak bisa membuka pilihan wallpaper"
                 )
             },
-            Entry(0, "Launcher default", if (isDefaultHome()) "Aktif" else "Belum diatur") { openSafe(Intent(Settings.ACTION_HOME_SETTINGS)) }
+            Entry(0, "Launcher default", if (isDefaultHome()) "Aktif" else "Belum diatur") { requestDefaultHome() }
         ))
     }
 
@@ -1843,9 +1972,13 @@ class MainActivity : Activity() {
                 textSize = 14f
                 setTextColor(Color.GRAY)
             })
+            val typed = searchBox.text.toString().trim()
+            if (typed.isNotEmpty()) {
+                list.addView(actionRow("Cari \"$typed\" di web") { webSearch(typed) })
+            }
         }
         val mode = iconStyle
-        res.forEach { app -> list.addView(row(app, mode, 18f)) }
+        res.take(80).forEach { app -> list.addView(row(app, mode, 18f)) }
     }
 
     // ---------- Ketuk 2x untuk kunci layar ----------
@@ -1872,6 +2005,10 @@ class MainActivity : Activity() {
     }
 
     private fun lockScreen() {
+        if (Build.VERSION.SDK_INT < 28) {
+            toast("Fitur ini butuh Android 9 ke atas")
+            return
+        }
         val svc = LockService.instance
         if (svc == null) {
             toast("Aktifkan layanan aksesibilitas Mini Launcher")
@@ -1981,6 +2118,181 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Animasi, hemat daya & kompatibilitas ----------
+
+    private fun isLowRam(): Boolean = try {
+        (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).isLowRamDevice
+    } catch (e: Exception) { false }
+
+    // Animasi transisi: hormati pilihan pengguna dan skala animasi sistem (0 = mati)
+    private fun motionOn(): Boolean {
+        if (!animPref) return false
+        return try {
+            Settings.Global.getFloat(contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
+        } catch (e: Exception) { true }
+    }
+
+    // Animasi yang berjalan terus (EQ, kedip titik dua, denyut baterai, kursor): mati di HP RAM kecil
+    private fun ambientOn(): Boolean = motionOn() && !isLowRam()
+
+    private fun applyMotion() {
+        val amb = ambientOn()
+        dotClock.blink = amb
+        nowEq.animated = amb
+        if (!amb) setPulse(false)
+        if (amb && cozy && showInfo) startCursor() else stopCursor()
+    }
+
+    private fun setPulse(on: Boolean) {
+        if (on) {
+            if (pulse == null) {
+                pulse = ObjectAnimator.ofFloat(batteryFill, View.ALPHA, 1f, 0.4f).apply {
+                    duration = 900
+                    repeatCount = ValueAnimator.INFINITE
+                    repeatMode = ValueAnimator.REVERSE
+                    start()
+                }
+            }
+        } else {
+            pulse?.cancel()
+            pulse = null
+            batteryFill.alpha = 1f
+        }
+    }
+
+    // Kursor "_" berkedip di sapaan (tema Cozy)
+    private fun renderGreeting() {
+        greeting.text = greetingBase + (if (cursorActive && cursorOn) "_" else "")
+    }
+
+    private val cursorRun = object : Runnable {
+        override fun run() {
+            cursorOn = !cursorOn
+            renderGreeting()
+            greeting.postDelayed(this, 600L)
+        }
+    }
+
+    private fun startCursor() {
+        if (cursorActive) return
+        cursorActive = true
+        cursorOn = true
+        renderGreeting()
+        greeting.removeCallbacks(cursorRun)
+        greeting.postDelayed(cursorRun, 600L)
+    }
+
+    private fun stopCursor() {
+        cursorActive = false
+        greeting.removeCallbacks(cursorRun)
+        renderGreeting()
+    }
+
+    // Elemen header muncul bergantian (geser naik + fade)
+    private fun animateHeaderIn() {
+        for (i in 0 until header.childCount) {
+            val v = header.getChildAt(i)
+            if (v.visibility == View.GONE) continue
+            v.alpha = 0f
+            v.translationY = dp(14).toFloat()
+            v.animate()
+                .setStartDelay(i * 45L)
+                .alpha(1f).translationY(0f)
+                .setDuration(260)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
+        }
+    }
+
+    // Umpan balik sentuh halus pada jam & tanggal
+    private fun pressFx(v: View) {
+        v.post {
+            v.pivotX = 0f
+            v.pivotY = v.height / 2f
+        }
+        v.setOnTouchListener { x, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN ->
+                    x.animate().setStartDelay(0).alpha(0.7f).scaleX(0.97f).scaleY(0.97f).setDuration(80).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    x.animate().setStartDelay(0).alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).start()
+            }
+            false
+        }
+    }
+
+    // Alarm berikutnya (tanpa izin tambahan), tampil di baris info
+    private fun nextAlarmText(): String? = try {
+        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val info = am.nextAlarmClock
+        if (info == null) {
+            null
+        } else {
+            val cal = java.util.Calendar.getInstance()
+            cal.timeInMillis = info.triggerTime
+            DateFormat.format(if (DateFormat.is24HourFormat(this)) "HH.mm" else "h.mm a", cal).toString()
+        }
+    } catch (e: Exception) { null }
+
+    private fun updateAlarm() {
+        val t = nextAlarmText()
+        if (t == null) {
+            alarmText.visibility = View.GONE
+        } else {
+            alarmText.text = "alarm $t"
+            alarmText.visibility = View.VISIBLE
+        }
+    }
+
+    // Baris aksi sederhana (mis. "Cari di web")
+    private fun actionRow(label: String, onClick: () -> Unit): View = TextView(this).apply {
+        text = label
+        textSize = 16f
+        setTextColor(accentNow)
+        typeface = fontBody()
+        setPadding(0, dp(14), 0, dp(14))
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        setOnClickListener { onClick() }
+    }
+
+    private fun webSearch(q: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, q))
+        } catch (e: Exception) {
+            openSafe(
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))),
+                "Tidak ada aplikasi untuk mencari di web"
+            )
+        }
+    }
+
+    private fun openHomeSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+        } catch (e: Exception) {
+            openSafe(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    // Android 13+ mewajibkan penanda ekspor untuk receiver yang didaftarkan lewat kode
+    private fun regReceiver(r: BroadcastReceiver, f: IntentFilter): Intent? =
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(r, f)
+        }
+
+    private val searchRun = Runnable {
+        if (viewMode == 3) safely { renderSearch() }
+    }
+
+    // Ukuran font / kerapatan layar berubah: bangun ulang agar semua ukuran ikut menyesuaikan
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (newConfig.fontScale != lastFont || newConfig.densityDpi != lastDpi) recreate()
+    }
+
     // ---------- Cache ----------
 
     private fun dirSize(dir: java.io.File?): Long =
@@ -1997,8 +2309,8 @@ class MainActivity : Activity() {
 
     // Membersihkan cache launcher ini saja (ikon di memori + file cache).
     // Android tidak mengizinkan aplikasi biasa menghapus cache aplikasi lain.
-    private fun clearCache() {
-        val before = cacheBytes()
+    // Membersihkan cache launcher ini saja (ikon di memori + file cache).
+    private fun clearOwnCache() {
         iconCache.evictAll()
         noMono.clear()
         tintable.clear()
@@ -2009,7 +2321,104 @@ class MainActivity : Activity() {
         lastSig = null
         renderCurrent()
         precomputeIcons()
+    }
+
+    private fun clearCache() {
+        val before = cacheBytes()
+        clearOwnCache()
         toast("Cache dibersihkan · ${formatSize(before)}")
+    }
+
+    // ---------- Cache seluruh perangkat ----------
+    // Android tidak mengizinkan aplikasi biasa menghapus cache aplikasi lain secara diam-diam.
+    // Jalur resmi yang tersedia:
+    //  1) Android 11+ dengan izin "Akses semua file": dialog sistem untuk membersihkan cache semua aplikasi
+    //     (cache di penyimpanan eksternal; cache internal aplikasi lain tidak bisa disentuh)
+    //  2) Membuka aplikasi pembersih bawaan HP (iManager Vivo, Device Care, dll.)
+    //  3) Halaman penyimpanan sistem
+
+    private val REQ_CLEAR_CACHE = 4711
+
+    private val cleanerPkgs = listOf(
+        "com.iqoo.secure", "com.miui.cleaner", "com.miui.securitycenter",
+        "com.samsung.android.lool", "com.coloros.phonemanager", "com.oplus.phonemanager",
+        "com.huawei.systemmanager", "com.transsion.phonemaster",
+        "com.google.android.apps.nbu.files"
+    )
+
+    private fun canSystemClear(): Boolean =
+        Build.VERSION.SDK_INT >= 30 && try { Environment.isExternalStorageManager() } catch (e: Exception) { false }
+
+    private fun showCacheMenu() {
+        val es = mutableListOf<Entry>()
+        es.add(Entry(0, "Cache launcher ini", cacheSizeText()) { clearCache() })
+        es.add(Entry(0, "Seluruh perangkat",
+            if (canSystemClear()) "Dialog sistem" else "Lewat aplikasi pembersih") {
+            clearDeviceCache()
+        })
+        if (Build.VERSION.SDK_INT >= 30) {
+            es.add(Entry(0, "Izin pembersihan penuh",
+                if (canSystemClear()) "Aktif" else "Belum diberi") {
+                openAllFilesAccess()
+            })
+        }
+        showSheet("Bersihkan cache", null, es)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun clearDeviceCache() {
+        clearOwnCache()
+        if (canSystemClear()) {
+            try {
+                startActivityForResult(Intent(StorageManager.ACTION_CLEAR_APP_CACHE), REQ_CLEAR_CACHE)
+                return
+            } catch (e: Exception) { /* lanjut ke aplikasi pembersih */ }
+        }
+        openCleaner()
+    }
+
+    private fun openCleaner() {
+        for (p in cleanerPkgs) {
+            val i = try { packageManager.getLaunchIntentForPackage(p) } catch (e: Exception) { null }
+            if (i != null) {
+                try {
+                    startActivity(i)
+                    toast("Pilih bersihkan cache di aplikasi ini")
+                    return
+                } catch (e: Exception) { /* coba berikutnya */ }
+            }
+        }
+        try {
+            startActivity(Intent(StorageManager.ACTION_MANAGE_STORAGE))
+            return
+        } catch (e: Exception) { /* coba berikutnya */ }
+        openSafe(Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS), "Tidak bisa membuka pengaturan penyimpanan")
+    }
+
+    private fun openAllFilesAccess() {
+        try {
+            startActivity(Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:$packageName")
+            ))
+        } catch (e: Exception) {
+            openSafe(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                "Tidak bisa membuka pengaturan izin")
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_ROLE && resultCode == Activity.RESULT_OK) {
+            toast("Mini Launcher jadi launcher default")
+        }
+        if (requestCode == REQ_CLEAR_CACHE) {
+            when (resultCode) {
+                Activity.RESULT_OK -> toast("Cache aplikasi di perangkat dibersihkan")
+                OsConstants.EIO -> toast("Sebagian cache gagal dibersihkan")
+            }
+        }
     }
 
     // Daftar pilihan dengan centang; setelah memilih kembali ke Pengaturan

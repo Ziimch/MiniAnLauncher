@@ -9,6 +9,7 @@ import android.view.View
 import java.util.Calendar
 
 // Jam gaya dot-matrix retro: setiap angka tersusun dari titik 5x7.
+// Titik dua berkedip tiap detik (jika animasi aktif); berhenti sendiri saat layar/aktivitas tidak terlihat.
 class DotClockView(context: Context) : View(context) {
 
     private val on = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -27,6 +28,13 @@ class DotClockView(context: Context) : View(context) {
             invalidate()
         }
 
+    // true: titik dua berkedip (tick tiap detik). false: statis (tick tiap menit).
+    var blink: Boolean = true
+        set(v) {
+            field = v
+            restart()
+        }
+
     private val digits = arrayOf(
         arrayOf("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
         arrayOf("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
@@ -40,15 +48,21 @@ class DotClockView(context: Context) : View(context) {
         arrayOf("01110", "10001", "10001", "01111", "00001", "00010", "01100")
     )
 
-    // Posisi kolom awal: jam (2 angka), titik dua, menit (2 angka)
+    // Posisi kolom awal: jam (2 angka), titik dua di kolom 12, menit (2 angka)
     private val starts = intArrayOf(0, 6, 14, 20)
 
     private val tick = object : Runnable {
         override fun run() {
             invalidate()
             val now = System.currentTimeMillis()
-            postDelayed(this, 60_000L - now % 60_000L + 30L)
+            val delay = if (blink) 1000L - now % 1000L + 5L else 60_000L - now % 60_000L + 30L
+            postDelayed(this, delay)
         }
+    }
+
+    private fun restart() {
+        removeCallbacks(tick)
+        if (isAttachedToWindow && isShown && windowVisibility == VISIBLE) post(tick)
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
@@ -57,8 +71,7 @@ class DotClockView(context: Context) : View(context) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        removeCallbacks(tick)
-        if (visibility == VISIBLE) post(tick)
+        restart()
     }
 
     override fun onDetachedFromWindow() {
@@ -68,8 +81,12 @@ class DotClockView(context: Context) : View(context) {
 
     override fun onVisibilityChanged(changedView: View, visibility: Int) {
         super.onVisibilityChanged(changedView, visibility)
-        removeCallbacks(tick)
-        if (visibility == VISIBLE && isAttachedToWindow) post(tick)
+        restart()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        restart()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -82,6 +99,7 @@ class DotClockView(context: Context) : View(context) {
         val m = cal.get(Calendar.MINUTE)
         val nums = intArrayOf(h / 10, h % 10, m / 10, m % 10)
         val r = cell * 0.36f
+        val colonLit = !blink || (System.currentTimeMillis() / 1000L) % 2L == 0L
 
         for (row in 0 until 7) {
             for (col in 0 until 25) {
@@ -92,7 +110,7 @@ class DotClockView(context: Context) : View(context) {
                     val c = col - starts[k]
                     if (c in 0..4 && digits[nums[k]][row][c] == '1') lit = true
                 }
-                if (col == 12 && (row == 2 || row == 4)) lit = true
+                if (col == 12 && (row == 2 || row == 4)) lit = colonLit
                 canvas.drawCircle(cx, cy, r, if (lit) on else off)
             }
         }

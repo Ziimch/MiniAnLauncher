@@ -8,7 +8,8 @@ import android.graphics.RectF
 import android.view.View
 import kotlin.math.abs
 
-// Equalizer pixel retro: 5 batang dari kotak-kotak kecil yang naik-turun bertahap (gaya chiptune).
+// Equalizer pixel retro: 5 batang dari kotak kecil yang naik-turun bertahap (gaya chiptune).
+// Berhenti sendiri saat tidak terlihat; statis jika animasi dimatikan / HP RAM kecil.
 class PixelEqView(context: Context) : View(context) {
 
     private val bars = 5
@@ -21,8 +22,8 @@ class PixelEqView(context: Context) : View(context) {
     private val off = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rect = RectF()
     private val rnd = java.util.Random()
-    private val levels = IntArray(bars) { 1 }
-    private val targets = IntArray(bars) { 1 }
+    private val levels = intArrayOf(2, 4, 5, 3, 2)
+    private val targets = IntArray(bars) { levels[it] }
 
     var pixelColor: Int = Color.WHITE
         set(v) {
@@ -38,6 +39,13 @@ class PixelEqView(context: Context) : View(context) {
 
     // false: batang turun ke dasar (tidak ada suara)
     var playing: Boolean = true
+
+    // false: pola statis, tidak ada timer sama sekali
+    var animated: Boolean = true
+        set(v) {
+            field = v
+            restart()
+        }
 
     private val step = object : Runnable {
         override fun run() {
@@ -61,6 +69,11 @@ class PixelEqView(context: Context) : View(context) {
         }
     }
 
+    private fun restart() {
+        removeCallbacks(step)
+        if (animated && isAttachedToWindow && isShown && windowVisibility == VISIBLE) post(step)
+    }
+
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         setMeasuredDimension(
             (bars * cell + (bars - 1) * gap).toInt(),
@@ -70,8 +83,7 @@ class PixelEqView(context: Context) : View(context) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        removeCallbacks(step)
-        if (visibility == VISIBLE) post(step)
+        restart()
     }
 
     override fun onDetachedFromWindow() {
@@ -81,8 +93,12 @@ class PixelEqView(context: Context) : View(context) {
 
     override fun onVisibilityChanged(changedView: View, visibility: Int) {
         super.onVisibilityChanged(changedView, visibility)
-        removeCallbacks(step)
-        if (visibility == VISIBLE && isAttachedToWindow) post(step)
+        restart()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        restart()
     }
 
     override fun onDraw(canvas: Canvas) {

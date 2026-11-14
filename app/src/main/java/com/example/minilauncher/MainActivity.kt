@@ -61,6 +61,9 @@ import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.RectF
 import kotlin.math.abs
 import kotlin.math.exp
 
@@ -509,6 +512,10 @@ class MainActivity : Activity() {
             addDataScheme("package")
         })
 
+        val wlp = window.attributes
+        wlp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        window.attributes = wlp
+
         setContentView(root)
         applySystemUi()
         applyBackground()
@@ -697,6 +704,10 @@ class MainActivity : Activity() {
     // Latar: hitam polos, atau wallpaper sistem dengan lapisan gelap
     @Suppress("DEPRECATION")
     private fun applyBackground() {
+        val bar = if (bgMode == 0) cBg() else Color.TRANSPARENT
+        window.navigationBarColor = bar
+        window.statusBarColor = bar
+        if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
         if (bgMode == 0) {
             window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
             window.setBackgroundDrawable(ColorDrawable(cBg()))
@@ -1007,18 +1018,20 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // Ikon monokrom, 3 lapis:
-    // a) Android 13+: lapisan monokrom ikon adaptif (diwarnai aksen saat ditampilkan)
-    // b) selain itu: ikon asli diubah ke grayscale kontras tinggi agar seragam
-    // c) gagal total (return null / exception): pemanggil memakai lingkaran inisial
+    // Ikon monokrom yang menyatu dengan tema (Klasik: hitam-putih, Cozy: krem hangat):
+    // a) Android 13+: lapisan monokrom ikon adaptif
+    // b) ikon biasa: latar dibuang, hanya simbolnya (siluet) yang dipakai
+    // c) ikon berupa gambar penuh (game, foto): ubin grayscale bersudut membulat
+    //    (diberi nada duotone cokelat-krem saat tema Cozy)
+    // d) gagal dimuat sama sekali: pemanggil memakai lingkaran inisial
     private fun buildMono(pkg: String): Bitmap? {
         val raw = packageManager.getApplicationIcon(pkg)
         val d = raw.constantState?.newDrawable()?.mutate() ?: raw
-        val s = 96
 
         if (Build.VERSION.SDK_INT >= 33 && d is AdaptiveIconDrawable) {
             val m = d.monochrome
             if (m != null) {
+                val s = 96
                 val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
                 val inset = (s * 0.25f).toInt() // hanya 66% bagian tengah layer yang terlihat
                 m.setBounds(-inset, -inset, s + inset, s + inset)
@@ -1030,31 +1043,155 @@ class MainActivity : Activity() {
             }
         }
 
+        val sil = silhouette(d)
+        if (sil != null) {
+            tintable.add(pkg)
+            return sil
+        }
+        return artTile(d)
+    }
+
+    // Buang latar ikon (warna dominan di tepi), sisakan simbolnya sebagai bentuk putih
+    private fun silhouette(d: Drawable): Bitmap? {
+        val s = 96
+        val src = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        d.setBounds(0, 0, s, s)
+        d.draw(Canvas(src))
+        val px = IntArray(s * s)
+        src.getPixels(px, 0, s, 0, 0, s, s)
+        src.recycle()
+
+        val pts = arrayOf(
+            intArrayOf(50, 10), intArrayOf(50, 90), intArrayOf(10, 50), intArrayOf(90, 50),
+            intArrayOf(22, 22), intArrayOf(78, 22), intArrayOf(22, 78), intArrayOf(78, 78)
+        )
+        val rs = ArrayList<Int>()
+        val gs = ArrayList<Int>()
+        val bs = ArrayList<Int>()
+        for (p in pts) {
+            val c = px[(p[1] * s / 100) * s + (p[0] * s / 100)]
+            if (Color.alpha(c) > 220) {
+                rs.add(Color.red(c)); gs.add(Color.green(c)); bs.add(Color.blue(c))
+            }
+        }
+        val hasBg = rs.size >= 5
+        val bgR = if (hasBg) rs.sorted()[rs.size / 2] else 0
+        val bgG = if (hasBg) gs.sorted()[gs.size / 2] else 0
+        val bgB = if (hasBg) bs.sorted()[bs.size / 2] else 0
+
+        val out = IntArray(s * s)
+        var minX = s; var minY = s; var maxX = -1; var maxY = -1
+        var on = 0
+        for (y in 0 until s) {
+            for (x in 0 until s) {
+                val c = px[y * s + x]
+                val a0 = Color.alpha(c)
+                val a = when {
+                    a0 == 0 -> 0
+                    hasBg -> {
+                        val dist = maxOf(
+                            abs(Color.red(c) - bgR),
+                            abs(Color.green(c) - bgG),
+                            abs(Color.blue(c) - bgB)
+                        )
+                        (((dist - 30) / 80f).coerceIn(0f, 1f) * a0).toInt()
+                    }
+                    else -> a0
+                }
+                out[y * s + x] = Color.argb(a, 255, 255, 255)
+                if (a > 60) {
+                    on++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        // Kosong, terlalu sedikit, atau terlalu penuh (gambar utuh) -> bukan ikon simbol
+        if (maxX < 0 || on > (s * s * 0.5f).toInt() || on < (s * s * 0.012f).toInt()) return null
+
+        val bw = maxX - minX + 1
+        val bh = maxY - minY + 1
+        val side = maxOf(bw, bh)
+        val dest = side + side / 6
+        val glyph = Bitmap.createBitmap(out, s, s, Bitmap.Config.ARGB_8888)
+        val result = Bitmap.createBitmap(dest, dest, Bitmap.Config.ARGB_8888)
+        val left = (dest - bw) / 2
+        val top = (dest - bh) / 2
+        Canvas(result).drawBitmap(
+            glyph,
+            Rect(minX, minY, maxX + 1, maxY + 1),
+            Rect(left, top, left + bw, top + bh),
+            Paint(Paint.FILTER_BITMAP_FLAG)
+        )
+        glyph.recycle()
+        val fin = Bitmap.createScaledBitmap(result, 64, 64, true)
+        if (fin !== result) result.recycle()
+        return fin
+    }
+
+    // Ikon gambar penuh: grayscale, sudut membulat, kontras sedang
+    private fun artTile(d: Drawable): Bitmap {
+        val s = 96
         val src = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
         d.setBounds(0, 0, s, s)
         d.draw(Canvas(src))
         val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        paint.color = Color.WHITE
+        canvas.drawRoundRect(RectF(0f, 0f, s.toFloat(), s.toFloat()), s * 0.22f, s * 0.22f, paint)
         val cm = ColorMatrix()
         cm.setSaturation(0f)
-        val k = 1.6f
-        val t = (-0.5f * k + 0.5f) * 255f + 38f // kontras + sedikit terang agar terlihat di latar hitam
+        val k = 1.2f
+        val t = (-0.5f * k + 0.5f) * 255f
         cm.postConcat(ColorMatrix(floatArrayOf(
             k, 0f, 0f, 0f, t,
             0f, k, 0f, 0f, t,
             0f, 0f, k, 0f, t,
             0f, 0f, 0f, 1f, 0f
         )))
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
         paint.colorFilter = ColorMatrixColorFilter(cm)
-        Canvas(out).drawBitmap(src, 0f, 0f, paint)
+        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        canvas.drawBitmap(src, 0f, 0f, paint)
         src.recycle()
         val fin = Bitmap.createScaledBitmap(out, 64, 64, true)
         if (fin !== out) out.recycle()
         return fin
     }
 
+    // Duotone cokelat tua -> krem untuk ubin gambar di tema Cozy
+    private val cozyDuo: ColorMatrixColorFilter by lazy {
+        val dr = 0x2A; val dg = 0x1F; val db = 0x16
+        val lr = 243; val lg = 231; val lb = 211
+        ColorMatrixColorFilter(floatArrayOf(
+            (lr - dr) / 255f, 0f, 0f, 0f, dr.toFloat(),
+            (lg - dg) / 255f, 0f, 0f, 0f, dg.toFloat(),
+            (lb - db) / 255f, 0f, 0f, 0f, db.toFloat(),
+            0f, 0f, 0f, 1f, 0f
+        ))
+    }
+
+    // Klasik: ubin gambar diredupkan sedikit agar tidak menyilaukan di latar hitam
+    private val classicDim: ColorMatrixColorFilter by lazy {
+        ColorMatrixColorFilter(floatArrayOf(
+            0.85f, 0f, 0f, 0f, 0f,
+            0f, 0.85f, 0f, 0f, 0f,
+            0f, 0f, 0.85f, 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        ))
+    }
+
+    // Siluet: putih (Klasik) atau krem (Cozy). Ubin gambar: abu-abu / duotone krem.
     private fun tintFor(iv: ImageView, pkg: String, mode: Int) {
-        if (mode == 2 && pkg in tintable) iv.setColorFilter(accentNow) else iv.clearColorFilter()
+        when {
+            mode != 2 -> iv.clearColorFilter()
+            pkg in tintable -> iv.setColorFilter(cText())
+            pkg in noMono -> iv.clearColorFilter()
+            cozy -> iv.colorFilter = cozyDuo
+            else -> iv.colorFilter = classicDim
+        }
     }
 
     // ---------- Aksi ----------
